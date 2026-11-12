@@ -13,6 +13,7 @@
 #define MEM_FABRIC_MMC_META_MANAGER_H
 
 #include <atomic>
+#include <list>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -129,6 +130,15 @@ struct MmcMetaExtConfig {
     uint64_t pendingWaitTimeoutMs = 300U;
 };
 
+// A logical KV page consists of several physical MemCache keys, for example K and V.
+// The group is MetaService-only metadata; MmcMemObjMeta still describes replicas and
+// media tiers of one physical key.
+struct MmcLogicalPageGroupDesc {
+    std::string groupKey;
+    std::string parentGroupKey;
+    std::vector<std::string> memberKeys;
+};
+
 class MmcMetaManager : public MmcReferable {
     friend class TestMmcMetaManager;
 
@@ -223,6 +233,7 @@ public:
         rewarmThreadPool_->Destroy();
         removeThreadPool_->Destroy();
         MmcMemBlob::ssdPreFreeHandler_ = nullptr;
+        ClearLogicalPageGroups();
         started_ = false;
         MMC_LOG_TRACE("Stop MmcMetaManager");
     }
@@ -265,6 +276,22 @@ public:
      * @param key          [in] key of the to-be-removed meta object
      */
     Result Remove(const std::string &key);
+
+    /**
+     * @brief Register a readable logical KV page and its physical component keys.
+     *        A group can have one optional parent group. Removing a member of a
+     *        leaf group removes all members; non-leaf groups are protected.
+     */
+    Result RegisterLogicalPageGroup(const MmcLogicalPageGroupDesc &group);
+
+    /**
+     * @brief Atomically register ordered logical KV page groups.
+     *
+     * Parents may be supplied earlier in this batch. If validation fails, no
+     * new group in the batch is made visible.
+     */
+    Result RegisterLogicalPageGroups(const std::vector<MmcLogicalPageGroupDesc> &groups,
+                                     std::vector<Result> &results);
 
     /**
      * @brief remove all the keys
@@ -566,6 +593,23 @@ private:
 
     Result RebuildMeta(std::vector<std::pair<std::string, MmcMemBlobDesc>> &blobList);
 
+    Result RemovePhysicalKey(const std::string &key);
+    Result PrepareLogicalPageGroupRemove(const std::string &key, std::vector<std::string> &memberKeys);
+    Result FinalizeLogicalPageGroupRemove(const std::string &key);
+    void AbortLogicalPageGroupRemove(const std::string &key);
+    Result EvictLogicalPageGroup(const std::string &key, MediaType srcMedia, size_t &evictedMemberCount);
+    Result MoveLogicalPageGroup(const std::vector<std::string> &memberKeys, MediaType srcMedia, MediaType dstMedia,
+                                bool removeSource);
+    Result PrepareLogicalPageGroupMove(const std::string &key, std::vector<std::string> &memberKeys);
+    void CompleteLogicalPageGroupMove(const std::string &key);
+    Result RewarmLogicalPageGroup(const std::string &key, MediaType srcMedia, MediaType dstMedia);
+    void InvalidateLogicalPageGroup(const std::string &key);
+    void PromoteLogicalPageGroup(const std::string &key);
+    size_t EvictLogicalPageGroups(MediaType media, size_t targetMemberCount);
+    bool IsLogicalPageGroupMember(const std::string &key) const;
+    bool IsReadableKey(const std::string &key);
+    void ClearLogicalPageGroups();
+
     Result RemoveBlobs(uint32_t rank, MediaType mediaType);
     Result RemoveBlobsForDeadRank(uint32_t rank, MediaType mediaType);
 
@@ -749,6 +793,13 @@ private:
         std::vector<size_t> groupIndices;
     };
 
+    struct LogicalPageGroupMoveEntry {
+        std::string key;
+        MmcMemObjMetaPtr meta;
+        MmcMemBlobDesc srcDesc;
+        MmcMemBlobPtr dstBlob;
+    };
+
     struct RewarmCtx {
         uint32_t opRankId = 0;
         uint32_t opSeq = 0;
@@ -851,6 +902,18 @@ private:
     MmcThreadPoolPtr removeThreadPool_;
     // EraseIf 并行执行专用池：线程数按 shard 数对齐（上限 kShardLruPoolMax）
     MmcThreadPoolPtr shardLruThreadPool_;
+    struct LogicalPageGroup {
+        std::string parentGroupKey;
+        std::vector<std::string> memberKeys;
+        bool removing{false};
+        bool moving{false};
+    };
+    mutable std::mutex logicalPageGroupMutex_;
+    std::unordered_map<std::string, LogicalPageGroup> logicalPageGroups_;
+    std::unordered_map<std::string, std::string> logicalPageGroupByMember_;
+    std::unordered_map<std::string, size_t> logicalPageGroupChildrenCount_;
+    std::list<std::string> logicalPageGroupLru_;
+    std::unordered_map<std::string, std::list<std::string>::iterator> logicalPageGroupLruByKey_;
     // 由 MetaService 冷启动配置统一设置。
     SsdMetadataMode ssdMetadataMode_{MMC_SSD_METADATA_AGGREGATED};
     std::unordered_set<uint32_t> ssdEnabledRanks_;

@@ -107,6 +107,13 @@ public:
                                   const std::vector<size_t> &sizes, const int32_t direct = 3,
                                   const ReplicateConfig &replicateConfig = {}) override;
 
+    std::vector<int> BatchPutFromWithGroups(const std::vector<std::string> &keys,
+                                            const std::vector<std::string> &groupKeys,
+                                            const std::vector<std::string> &parentGroupKeys,
+                                            const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+                                            const int32_t direct = 3,
+                                            const ReplicateConfig &replicateConfig = {}) override;
+
     int PutFromLayers(const std::string &key, const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
                       const int32_t direct = 9, const ReplicateConfig &replicateConfig = {}) override;
 

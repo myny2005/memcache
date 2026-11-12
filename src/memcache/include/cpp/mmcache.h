@@ -246,8 +246,20 @@ public:
      * negative value on error
      */
     virtual std::vector<int> BatchPutFrom(const std::vector<std::string> &keys, const std::vector<void *> &buffers,
-                                          const std::vector<size_t> &sizes, const int32_t direct = 3,
-                                          const ReplicateConfig &replicateConfig = {}) = 0;
+                                           const std::vector<size_t> &sizes, const int32_t direct = 3,
+                                           const ReplicateConfig &replicateConfig = {}) = 0;
+
+    /**
+     * @brief Put physical KV components and commit their logical page groups.
+     * @param groupKeys Logical page key for every physical key, for example the shared K/V page hash
+     * @param parentGroupKeys Optional logical parent page for every physical key; an empty key denotes root
+     */
+    virtual std::vector<int> BatchPutFromWithGroups(const std::vector<std::string> &keys,
+                                                     const std::vector<std::string> &groupKeys,
+                                                     const std::vector<std::string> &parentGroupKeys,
+                                                     const std::vector<void *> &buffers,
+                                                     const std::vector<size_t> &sizes, const int32_t direct = 3,
+                                                     const ReplicateConfig &replicateConfig = {}) = 0;
 
     /**
      * @brief Put object data directly from a pre-allocated buffer

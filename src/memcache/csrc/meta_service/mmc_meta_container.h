@@ -12,7 +12,10 @@
 #ifndef MF_HYBRID_MMC_META_CONTAINER_H
 #define MF_HYBRID_MMC_META_CONTAINER_H
 
+#include <functional>
 #include <memory>
+#include <utility>
+#include <vector>
 
 #include "mmc_blob_allocator.h"
 #include "mmc_def.h"
@@ -35,6 +38,9 @@ public:
     virtual Result Get(const Key &key, Value &value) = 0;
     virtual Result Erase(const Key &key) = 0;
     virtual Result Erase(const Key &key, Value &value) = 0;
+    // Atomically remove all keys from the container and return their values.
+    // On failure no key is removed and values is left empty.
+    virtual Result EraseBatch(const std::vector<Key> &keys, std::vector<std::pair<Key, Value>> &values) = 0;
     virtual Result EraseIfEmpty(const Key &key, std::function<bool(const Value &)> isEmptyFunc) = 0;
     virtual Result EraseAll(std::function<void(const Key &, const Value &)> removeFunc) = 0;
     virtual void EraseIf(std::function<bool(const Key &, const Value &)> matchFunc) = 0;

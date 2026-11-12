@@ -326,6 +326,72 @@ struct BatchAllocResponse : MsgBase {
     }
 };
 
+struct RegisterLogicalPageGroupsRequest : MsgBase {
+    std::vector<std::string> groupKeys_;
+    std::vector<std::string> parentGroupKeys_;
+    std::vector<std::vector<std::string>> memberKeys_;
+
+    RegisterLogicalPageGroupsRequest() : MsgBase{0, ML_REGISTER_LOGICAL_PAGE_GROUPS_REQ, 0} {}
+
+    RegisterLogicalPageGroupsRequest(const std::vector<std::string> &groupKeys,
+                                     const std::vector<std::string> &parentGroupKeys,
+                                     const std::vector<std::vector<std::string>> &memberKeys)
+        : MsgBase{0, ML_REGISTER_LOGICAL_PAGE_GROUPS_REQ, 0}, groupKeys_(groupKeys),
+          parentGroupKeys_(parentGroupKeys), memberKeys_(memberKeys)
+    {}
+
+    Result Serialize(NetMsgPacker &packer) const override
+    {
+        MMC_ASSERT_LOG_AND_RETURN(
+            groupKeys_.size() == parentGroupKeys_.size() && groupKeys_.size() == memberKeys_.size(),
+            "logical group request size mismatch", MMC_INVALID_PARAM);
+        packer.Serialize(msgVer);
+        packer.Serialize(msgId);
+        packer.Serialize(destRankId);
+        packer.Serialize(groupKeys_);
+        packer.Serialize(parentGroupKeys_);
+        packer.Serialize(memberKeys_);
+        return MMC_OK;
+    }
+
+    Result Deserialize(NetMsgUnpacker &packer) override
+    {
+        packer.Deserialize(msgVer);
+        packer.Deserialize(msgId);
+        packer.Deserialize(destRankId);
+        packer.Deserialize(groupKeys_);
+        packer.Deserialize(parentGroupKeys_);
+        packer.Deserialize(memberKeys_);
+        return groupKeys_.size() == parentGroupKeys_.size() && groupKeys_.size() == memberKeys_.size()
+                   ? MMC_OK
+                   : MMC_INVALID_PARAM;
+    }
+};
+
+struct RegisterLogicalPageGroupsResponse : MsgBase {
+    std::vector<Result> results_;
+
+    RegisterLogicalPageGroupsResponse() : MsgBase{0, ML_REGISTER_LOGICAL_PAGE_GROUPS_RESP, 0} {}
+
+    Result Serialize(NetMsgPacker &packer) const override
+    {
+        packer.Serialize(msgVer);
+        packer.Serialize(msgId);
+        packer.Serialize(destRankId);
+        packer.Serialize(results_);
+        return MMC_OK;
+    }
+
+    Result Deserialize(NetMsgUnpacker &packer) override
+    {
+        packer.Deserialize(msgVer);
+        packer.Deserialize(msgId);
+        packer.Deserialize(destRankId);
+        packer.Deserialize(results_);
+        return MMC_OK;
+    }
+};
+
 struct RemoveRequest : MsgBase {
     std::string key_;
 

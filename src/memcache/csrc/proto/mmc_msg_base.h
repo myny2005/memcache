@@ -61,6 +61,7 @@ enum LOCAL_META_OPCODE_REQ : int16_t {
     ML_BATCH_PROMOTE_REQ = 28,       /* promote keys in LRU without blob access */
     LM_BATCH_STORAGE_STAT_REQ = 29,  /* query UBSIO file status and size by keys in batch */
     ML_GET_EXTERNAL_CONFIG_REQ = 30, /* query external config managed by MetaService */
+    ML_REGISTER_LOGICAL_PAGE_GROUPS_REQ = 31, /* commit logical KV page groups after successful writes */
 };
 
 enum LOCAL_META_OPCODE_RESP : int16_t {
@@ -86,6 +87,7 @@ enum LOCAL_META_OPCODE_RESP : int16_t {
     ML_BATCH_PROMOTE_RESP = 28,       /* batch promote response */
     LM_BATCH_STORAGE_STAT_RESP = 29,  /* response to the UBSIO batch status query */
     ML_GET_EXTERNAL_CONFIG_RESP = 30, /* response to the external config query */
+    ML_REGISTER_LOGICAL_PAGE_GROUPS_RESP = 31,
 };
 } // namespace mmc
 } // namespace ock

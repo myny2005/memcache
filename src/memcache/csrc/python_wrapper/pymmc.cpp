@@ -906,6 +906,24 @@ PYBIND11_MODULE(_pymmc, m)
             "Put object data directly from pre-allocated buffers for multiple "
             "keys")
         .def(
+            "batch_put_from_with_groups",
+            [](MmcacheStore &self, const std::vector<std::string> &keys, const std::vector<std::string> &groupKeys,
+               const std::vector<std::string> &parentGroupKeys, const std::vector<uintptr_t> &bufferPtrs,
+               const std::vector<size_t> &sizes, const int32_t &direct, const ReplicateConfig &replicateConfig) {
+                std::vector<void *> buffers;
+                buffers.reserve(bufferPtrs.size());
+                for (const uintptr_t ptr : bufferPtrs) {
+                    buffers.push_back(reinterpret_cast<void *>(ptr));
+                }
+                py::gil_scoped_release release;
+                return self.BatchPutFromWithGroups(keys, groupKeys, parentGroupKeys, buffers, sizes, direct,
+                                                   replicateConfig);
+            },
+            py::arg("keys"), py::arg("group_keys"), py::arg("parent_group_keys"), py::arg("buffer_ptrs"),
+            py::arg("sizes"), py::arg("direct") = static_cast<int32_t>(SMEMB_COPY_H2G),
+            py::arg("replicateConfig") = defaultConfig,
+            "Put physical KV components and commit their logical page groups")
+        .def(
             "put_from_layers",
             [](MmcacheStore &self, const std::string &key, const std::vector<uintptr_t> &buffer_ptrs,
                const std::vector<size_t> &sizes, const int32_t &direct, const ReplicateConfig &replicateConfig) {

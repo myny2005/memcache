@@ -520,6 +520,52 @@ std::vector<int> MmcacheStore::BatchPutFrom(const std::vector<std::string> &keys
     return results;
 }
 
+std::vector<int> MmcacheStore::BatchPutFromWithGroups(const std::vector<std::string> &keys,
+                                                       const std::vector<std::string> &groupKeys,
+                                                       const std::vector<std::string> &parentGroupKeys,
+                                                       const std::vector<void *> &buffers,
+                                                       const std::vector<size_t> &sizes, const int32_t direct,
+                                                       const ReplicateConfig &replicateConfig)
+{
+    const size_t count = keys.size();
+    std::vector<int> results(count, MMC_INVALID_PARAM);
+    if (count == 0 || groupKeys.size() != count || parentGroupKeys.size() != count || buffers.size() != count ||
+        sizes.size() != count) {
+        return results;
+    }
+    if (MmcClientDefault::GetInstance() == nullptr) {
+        return results;
+    }
+
+    uint32_t type = 0;
+    if (direct == SMEMB_COPY_L2G) {
+        type = MEDIA_HBM;
+    } else if (direct == SMEMB_COPY_H2G) {
+        type = MEDIA_DRAM;
+    } else {
+        return results;
+    }
+
+    std::vector<mmc_buffer> bufferArray(count);
+    for (size_t i = 0; i < count; ++i) {
+        bufferArray[i] = {.addr = reinterpret_cast<uint64_t>(buffers[i]), .type = type, .offset = 0,
+                          .len = static_cast<uint64_t>(sizes[i])};
+    }
+    mmc_put_options options{};
+    if (!CopyPutOptions(replicateConfig, options)) {
+        return results;
+    }
+    const Result ret = MmcClientDefault::GetInstance()->BatchPutWithLogicalGroups(
+        keys, groupKeys, parentGroupKeys, bufferArray, options, ALLOC_RANDOM, results);
+    if (ret != MMC_OK) {
+        std::fill(results.begin(), results.end(), ret);
+    }
+    for (size_t i = 0; i < count; ++i) {
+        results[i] = ReturnWrapper(results[i], keys[i]);
+    }
+    return results;
+}
+
 std::vector<int> MmcacheStore::BatchGetInto(const std::vector<std::string> &keys, const std::vector<void *> &buffers,
                                             const std::vector<size_t> &sizes, const int32_t direct)
 {

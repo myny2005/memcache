@@ -134,6 +134,21 @@ Result MmcMetaMgrProxy::BatchAlloc(const BatchAllocRequest &req, BatchAllocRespo
     return MMC_OK;
 }
 
+Result MmcMetaMgrProxy::RegisterLogicalPageGroups(const RegisterLogicalPageGroupsRequest &req,
+                                                  RegisterLogicalPageGroupsResponse &resp)
+{
+    if (req.groupKeys_.size() != req.parentGroupKeys_.size() || req.groupKeys_.size() != req.memberKeys_.size()) {
+        return MMC_INVALID_PARAM;
+    }
+
+    std::vector<MmcLogicalPageGroupDesc> groups;
+    groups.reserve(req.groupKeys_.size());
+    for (size_t i = 0; i < req.groupKeys_.size(); ++i) {
+        groups.push_back({req.groupKeys_[i], req.parentGroupKeys_[i], req.memberKeys_[i]});
+    }
+    return metaMangerPtr_->RegisterLogicalPageGroups(groups, resp.results_);
+}
+
 Result MmcMetaMgrProxy::UpdateState(const UpdateRequest &req, Response &resp)
 {
     MmcMetaMetricManager &metricManager = MmcMetaMetricManager::GetInstance();

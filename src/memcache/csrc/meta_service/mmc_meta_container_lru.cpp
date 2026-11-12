@@ -20,6 +20,7 @@
 #include <memory>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "mmc_mem_obj_meta.h"
 #include "mmc_rwlock.h"
@@ -29,7 +30,13 @@ namespace ock {
 namespace mmc {
 
 template<typename Key, typename Value>
+class MmcMetaContainerShardedLRU;
+
+template<typename Key, typename Value>
 class MmcMetaContainerLRU : public MmcMetaContainer<Key, Value> {
+    template<typename, typename>
+    friend class MmcMetaContainerShardedLRU;
+
 public:
     explicit MmcMetaContainerLRU(std::function<MediaType(const Value &)> getTypeFunc) : getTypeFunc_(getTypeFunc) {}
 
@@ -152,6 +159,45 @@ public:
         if (valueItem.mediaType_ != MEDIA_NONE) {
             MmcWriteGuard lruLockGuard(lruLock_);
             lruLists_[valueItem.mediaType_].erase(valueItem.lruIter_);
+        }
+        return MMC_OK;
+    }
+
+    Result EraseBatch(const std::vector<Key> &keys, std::vector<std::pair<Key, Value>> &values) override
+    {
+        values.clear();
+        if (keys.empty()) {
+            return MMC_INVALID_PARAM;
+        }
+        std::unordered_set<Key> uniqueKeys;
+        uniqueKeys.reserve(keys.size());
+        for (const auto &key : keys) {
+            if (!uniqueKeys.insert(key).second) {
+                return MMC_INVALID_PARAM;
+            }
+        }
+
+        MmcWriteGuard metaGuard(metaLock_);
+        MmcWriteGuard lruGuard(lruLock_);
+        std::vector<typename std::unordered_map<Key, ValueLruItem>::iterator> mapIters;
+        mapIters.reserve(keys.size());
+        for (const auto &key : keys) {
+            const auto iter = metaMap_.find(key);
+            if (iter == metaMap_.end()) {
+                return MMC_UNMATCHED_KEY;
+            }
+            mapIters.push_back(iter);
+        }
+
+        values.reserve(keys.size());
+        for (const auto &iter : mapIters) {
+            values.emplace_back(iter->first, iter->second.value_);
+        }
+        for (const auto &iter : mapIters) {
+            if (iter->second.mediaType_ != MEDIA_NONE) {
+                lruLists_[iter->second.mediaType_].erase(iter->second.lruIter_);
+            }
+            metaMap_.erase(iter);
         }
         return MMC_OK;
     }
@@ -483,18 +529,39 @@ public:
             const size_t numEvictObjs =
                 std::max(std::min(oriNum * (nowThreshold - low) / high, oriNum), static_cast<size_t>(1));
 
-            for (size_t j = 0; j < numEvictObjs; ++j) {
-                EvictOneLeastRecentlyUsed(moveFunc, mediaType);
+            std::vector<EvictionCandidate> candidates;
+            candidates.reserve(oriNum);
+            {
+                MmcReadGuard metaGuard(metaLock_);
+                MmcReadGuard lruGuard(lruLock_);
+                for (auto iter = lruLists_[mediaType].rbegin(); iter != lruLists_[mediaType].rend(); ++iter) {
+                    const auto mapIter = metaMap_.find(*iter);
+                    if (mapIter != metaMap_.end() && mapIter->second.mediaType_ == mediaType) {
+                        candidates.push_back({*iter, mapIter->second.accessSequence_});
+                    }
+                }
+            }
+
+            size_t evicted = 0;
+            size_t attempted = 0;
+            for (const auto &candidate : candidates) {
+                if (evicted >= numEvictObjs) {
+                    break;
+                }
+                if (EvictCandidate(candidate, moveFunc, mediaType) != EvictResult::FAIL) {
+                    ++evicted;
+                }
+                ++attempted;
                 // Yield: periodically sleep to extend the lock-free window between evictions,
                 // giving blocked Put/Get/Exist threads enough time (~5us kernel scheduling)
                 // to wake up and acquire metaLock_ during the ~100us sleep window.
-                if (yieldInterval > 0 && yieldDurationUs > 0 && (j + 1) % yieldInterval == 0) {
+                if (yieldInterval > 0 && yieldDurationUs > 0 && attempted % yieldInterval == 0) {
                     std::this_thread::sleep_for(std::chrono::microseconds(yieldDurationUs));
                 }
             }
 
-            MMC_LOG_INFO("Evicted " << numEvictObjs << " keys from " << mediaType << ". Number of keys: " << oriNum
-                                    << " => " << (oriNum - numEvictObjs) << ".");
+            MMC_LOG_INFO("Evicted " << evicted << " keys from " << mediaType << ". Number of keys: " << oriNum
+                                    << " => " << (oriNum - evicted) << ".");
         }
     }
 

@@ -331,6 +331,19 @@ Write multiple keys in batches.
 
 Returns a list of processing results corresponding to each key. Each element `0` represents success, and a negative number represents failure.
 
+#### BatchPutFromWithGroups
+
+```c++
+virtual std::vector<int> BatchPutFromWithGroups(const std::vector<std::string> &keys,
+    const std::vector<std::string> &groupKeys, const std::vector<std::string> &parentGroupKeys,
+    const std::vector<void *> &buffers, const std::vector<size_t> &sizes, int32_t direct = 3,
+    const ReplicateConfig &replicateConfig = {}) = 0;
+```
+
+Writes physical KV components and commits logical page groups after all successful writes. `groupKeys[i]` identifies
+the logical page containing `keys[i]`; `parentGroupKeys[i]` identifies its prefix parent, or is empty for a root page.
+All physical members of a group are evicted together.
+
 #### BatchRemove
 
 ```c++

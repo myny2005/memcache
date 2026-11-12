@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <map>
 #include <memory>
 #include <random>
@@ -130,6 +131,7 @@ Result MmcMetaManager::Get(const std::string &key, uint64_t operateId, MmcBlobFi
         MMC_LOG_ERROR("Get key: " << key << " Promote failed. ErrCode: " << ret);
         return ret;
     }
+    PromoteLogicalPageGroup(key);
 
     TP_TRACE_BEGIN(TP_MMC_META_GET_FILL_METAOBJ);
     ret = ResolveAndFillMetaDesc(key, operateId, filterPtr, memObj, objMeta);
@@ -200,6 +202,24 @@ Result MmcMetaManager::TryRewarmForGet(const std::string &key, uint64_t operateI
     if (dstMedia == MEDIA_HBM || dstMedia == MEDIA_NONE) {
         MMC_LOG_WARN("Get: skip rewarm, src=" << srcMedia << ", dst=" << dstMedia << ", key=" << key);
         selectedBlob = lowerBlob;
+        return MMC_OK;
+    }
+
+    if (IsLogicalPageGroupMember(key)) {
+        // Rewarm every K/V component before exposing any destination replica.
+        // Release the current object lock because the group commit locks all
+        // member metas in a stable order.
+        guard.unlock();
+        const Result groupRet = RewarmLogicalPageGroup(key, srcMedia, dstMedia);
+        guard.lock();
+        if (groupRet != MMC_OK) {
+            return groupRet;
+        }
+        auto refreshed = ClassifyBlobs(memObj, MmcMakeRef<MmcBlobFilter>(UINT32_MAX, MEDIA_NONE, NONE));
+        if (refreshed.upperBlob == nullptr || refreshed.upperBlob->Type() != dstMedia) {
+            return MMC_ERROR;
+        }
+        selectedBlob = refreshed.upperBlob;
         return MMC_OK;
     }
 
@@ -477,6 +497,7 @@ void MmcMetaManager::ClassifyAndGroupMetaKey(size_t index, const MmcMemObjMetaPt
     const std::string &key = context.keys[index];
     context.objs[index] = memObj;
     metaContainer_->Promote(key);
+    PromoteLogicalPageGroup(key);
 
     std::unique_lock<std::mutex> guard(memObj->Mutex());
     MmcBlobFilterPtr filterPtr = MmcMakeRef<MmcBlobFilter>(UINT32_MAX, MEDIA_NONE, NONE);
@@ -935,6 +956,7 @@ Result MmcMetaManager::ExistKeyCore(const std::string &key, MmcMemObjMetaPtr &me
         MMC_LOG_ERROR("ExistKey key: " << key << " Promote failed. ErrCode: " << ret);
         return ret;
     }
+    PromoteLogicalPageGroup(key);
 
     // 在持有锁的单次遍历内完成分类并返回上层/低层可读 blob，
     // 调用方据此判断预取资格，无需再次加锁或再次读 blobs。
@@ -999,7 +1021,11 @@ Result MmcMetaManager::BatchExist(const std::vector<std::string> &keys, std::vec
 
 Result MmcMetaManager::PromoteKey(const std::string &key)
 {
-    return metaContainer_->Promote(key);
+    const Result ret = metaContainer_->Promote(key);
+    if (ret == MMC_OK) {
+        PromoteLogicalPageGroup(key);
+    }
+    return ret;
 }
 
 void MmcMetaManager::CheckAndEvict(MediaType media, uint64_t wantAllocSize)
@@ -1026,8 +1052,36 @@ void MmcMetaManager::CheckAndEvict(MediaType media, uint64_t wantAllocSize)
             const std::vector<MediaType> &needEvictListL, const std::vector<uint16_t> &nowMemoryThresholds,
             const std::function<EvictResult(const std::string &key, const MmcMemObjMetaPtr &objMeta, MediaType)>
                 &moveFuncL) {
-            metaContainer_->MultiLevelElimination(evictWatermarksL, needEvictListL, nowMemoryThresholds, moveFuncL,
-                                                  evictYieldInterval_, evictYieldDurationUs_);
+            std::vector<MediaType> remainingEvictList;
+            std::vector<uint16_t> remainingMemoryThresholds;
+            for (size_t i = 0; i < needEvictListL.size(); ++i) {
+                const MediaType media = needEvictListL[i];
+                if (media >= MEDIA_NONE || media == MEDIA_SSD) {
+                    remainingEvictList.push_back(media);
+                    remainingMemoryThresholds.push_back(nowMemoryThresholds[i]);
+                    continue;
+                }
+                const uint16_t highWatermark = evictWatermarksL[media].first;
+                const uint16_t lowWatermark = evictWatermarksL[media].second;
+                const uint16_t currentThreshold = nowMemoryThresholds[i];
+                size_t evictTarget = 0;
+                if (highWatermark != 0 && currentThreshold > lowWatermark) {
+                    const size_t keyCount = metaContainer_->GetKeyCount(media);
+                    evictTarget = std::max(
+                        std::min(keyCount * static_cast<size_t>(currentThreshold - lowWatermark) / highWatermark,
+                                 keyCount),
+                        static_cast<size_t>(1));
+                }
+                const size_t evictedMemberCount = EvictLogicalPageGroups(media, evictTarget);
+                if (evictTarget == 0 || evictedMemberCount < evictTarget) {
+                    remainingEvictList.push_back(media);
+                    remainingMemoryThresholds.push_back(currentThreshold);
+                }
+            }
+            if (!remainingEvictList.empty()) {
+                metaContainer_->MultiLevelElimination(evictWatermarksL, remainingEvictList, remainingMemoryThresholds,
+                                                       moveFuncL, evictYieldInterval_, evictYieldDurationUs_);
+            }
             bool expected = true;
             evictCheck_.compare_exchange_strong(expected, false);
         },
@@ -1126,6 +1180,34 @@ bool MmcMetaManager::ForceReleaseKey(const std::string &key, MediaType media, co
 {
     // 与 EvictCallBackFunction 同构但同步执行：双写已保证数据在目标层有副本，
     // 直接同步删除源层 blob 无需 move-down；有活跃租约时跳过（LRU 不动）。
+    if (IsLogicalPageGroupMember(key)) {
+        MmcMemObjMetaPtr groupedMeta;
+        if (metaContainer_->Get(key, groupedMeta) != MMC_OK || groupedMeta == nullptr) {
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> guard(groupedMeta->Mutex());
+            MmcBlobFilterPtr filter = MmcMakeRef<MmcBlobFilter>(UINT32_MAX, media, READABLE);
+            if (filter == nullptr) {
+                return false;
+            }
+            bool matchesTargetRank = false;
+            for (const auto &blob : groupedMeta->GetBlobs(filter)) {
+                if (std::find(targetRanks.begin(), targetRanks.end(), blob->Rank()) != targetRanks.end()) {
+                    matchesTargetRank = true;
+                    break;
+                }
+            }
+            if (!matchesTargetRank) {
+                return false;
+            }
+        }
+        // Do not keep the object lock while reserving the complete group: the
+        // atomic group path locks every member in stable order during commit.
+        size_t movedMemberCount = 0;
+        return EvictLogicalPageGroup(key, media, movedMemberCount) == MMC_OK && movedMemberCount != 0;
+    }
+
     MmcMemObjMetaPtr objMeta;
     if (metaContainer_->Get(key, objMeta) != MMC_OK || objMeta == nullptr) {
         return false;
@@ -1683,8 +1765,10 @@ Result MmcMetaManager::RemoveSsdBlob(const std::string &key, uint32_t rank)
     MMC_LOG_DEBUG("RemoveSsdBlob: key=" << key << ", rank=" << rank);
     if (objMeta->NumBlobs() == 0) {
         guard.unlock();
-        metaContainer_->Erase(key);
-        MMC_LOG_DEBUG("RemoveSsdBlob: key=" << key << " fully removed (no remaining blobs)");
+        // Losing the final physical replica invalidates the complete logical KV
+        // page. Route through Remove so K/V members are not left independently
+        // cached when this key belongs to a logical page group.
+        return Remove(key);
     }
     return MMC_OK;
 }
@@ -1764,6 +1848,34 @@ Result MmcMetaManager::AddSsdBlob(const std::string &key, const MmcMemBlobDesc &
 
 Result MmcMetaManager::Remove(const std::string &key)
 {
+    std::vector<std::string> memberKeys;
+    Result ret = PrepareLogicalPageGroupRemove(key, memberKeys);
+    if (ret != MMC_OK) {
+        return ret;
+    }
+    if (memberKeys.empty()) {
+        return RemovePhysicalKey(key);
+    }
+
+    std::vector<std::pair<std::string, MmcMemObjMetaPtr>> removedMetas;
+    ret = metaContainer_->EraseBatch(memberKeys, removedMetas);
+    if (ret != MMC_OK) {
+        AbortLogicalPageGroupRemove(key);
+        return ret;
+    }
+    ret = FinalizeLogicalPageGroupRemove(key);
+    if (ret != MMC_OK) {
+        MMC_LOG_ERROR("Remove logical page group finalization failed, key=" << key << ", ret=" << ret);
+    }
+    for (const auto &[memberKey, objMeta] : removedMetas) {
+        std::unique_lock<std::mutex> guard(objMeta->Mutex());
+        PushRemoveList(memberKey, objMeta, nullptr, true);
+    }
+    return ret;
+}
+
+Result MmcMetaManager::RemovePhysicalKey(const std::string &key)
+{
     MmcMemObjMetaPtr objMeta;
     auto ret = metaContainer_->Erase(key, objMeta);
     if (ret != MMC_OK || objMeta == nullptr) {
@@ -1775,8 +1887,334 @@ Result MmcMetaManager::Remove(const std::string &key)
     return MMC_OK;
 }
 
+bool MmcMetaManager::IsReadableKey(const std::string &key)
+{
+    MmcMemObjMetaPtr objMeta;
+    if (metaContainer_->Get(key, objMeta) != MMC_OK || objMeta == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> guard(objMeta->Mutex());
+    for (const auto &blob : objMeta->GetBlobs()) {
+        if (blob != nullptr && blob->State() == READABLE) {
+            return true;
+        }
+    }
+    return false;
+}
+
+Result MmcMetaManager::RegisterLogicalPageGroup(const MmcLogicalPageGroupDesc &group)
+{
+    std::vector<Result> results;
+    const Result ret = RegisterLogicalPageGroups({group}, results);
+    return ret == MMC_OK && results.size() == 1 ? results.front() : ret;
+}
+
+Result MmcMetaManager::RegisterLogicalPageGroups(const std::vector<MmcLogicalPageGroupDesc> &groups,
+                                                 std::vector<Result> &results)
+{
+    results.assign(groups.size(), MMC_INVALID_PARAM);
+    if (groups.empty()) {
+        return MMC_INVALID_PARAM;
+    }
+
+    std::unordered_set<std::string> batchGroupKeys;
+    std::unordered_set<std::string> batchMemberKeys;
+    for (const auto &group : groups) {
+        if (group.groupKey.empty() || group.memberKeys.empty() || group.groupKey == group.parentGroupKey ||
+            !batchGroupKeys.insert(group.groupKey).second) {
+            MMC_LOG_ERROR("RegisterLogicalPageGroups invalid group descriptor, group=" << group.groupKey);
+            return MMC_INVALID_PARAM;
+        }
+        std::unordered_set<std::string> groupMemberKeys;
+        for (const auto &memberKey : group.memberKeys) {
+            if (memberKey.empty() || !groupMemberKeys.insert(memberKey).second ||
+                !batchMemberKeys.insert(memberKey).second || !IsReadableKey(memberKey)) {
+                MMC_LOG_ERROR("RegisterLogicalPageGroups invalid or unreadable member, group=" << group.groupKey
+                                                                                                  << ", member=" << memberKey);
+                return MMC_INVALID_PARAM;
+            }
+        }
+    }
+
+    std::lock_guard<std::mutex> guard(logicalPageGroupMutex_);
+    std::unordered_set<std::string> visibleGroupKeys;
+    visibleGroupKeys.reserve(groups.size());
+    std::vector<bool> isNewGroup(groups.size(), false);
+    for (size_t i = 0; i < groups.size(); ++i) {
+        const auto &group = groups[i];
+        const auto existingIter = logicalPageGroups_.find(group.groupKey);
+        if (existingIter != logicalPageGroups_.end()) {
+            if (existingIter->second.removing || existingIter->second.moving ||
+                existingIter->second.parentGroupKey != group.parentGroupKey ||
+                existingIter->second.memberKeys != group.memberKeys) {
+                return MMC_DUPLICATED_OBJECT;
+            }
+            visibleGroupKeys.insert(group.groupKey);
+            continue;
+        }
+        if (!group.parentGroupKey.empty() && logicalPageGroups_.count(group.parentGroupKey) == 0 &&
+            visibleGroupKeys.count(group.parentGroupKey) == 0) {
+            MMC_LOG_ERROR("RegisterLogicalPageGroups parent must precede child, group=" << group.groupKey
+                                                                                          << ", parent=" << group.parentGroupKey);
+            return MMC_UNMATCHED_KEY;
+        }
+        if (!group.parentGroupKey.empty()) {
+            const auto parentIter = logicalPageGroups_.find(group.parentGroupKey);
+            if (parentIter != logicalPageGroups_.end() && (parentIter->second.removing || parentIter->second.moving)) {
+                MMC_LOG_ERROR("RegisterLogicalPageGroups parent is changing, group=" << group.groupKey
+                                                                                          << ", parent=" << group.parentGroupKey);
+                return MMC_UNMATCHED_STATE;
+            }
+        }
+        for (const auto &memberKey : group.memberKeys) {
+            if (logicalPageGroupByMember_.count(memberKey) != 0) {
+                MMC_LOG_ERROR("RegisterLogicalPageGroups member already belongs to a group, member=" << memberKey);
+                return MMC_DUPLICATED_OBJECT;
+            }
+        }
+        isNewGroup[i] = true;
+        visibleGroupKeys.insert(group.groupKey);
+    }
+
+    for (size_t i = 0; i < groups.size(); ++i) {
+        if (!isNewGroup[i]) {
+            results[i] = MMC_OK;
+            continue;
+        }
+        const auto &group = groups[i];
+        logicalPageGroups_.emplace(group.groupKey, LogicalPageGroup{group.parentGroupKey, group.memberKeys});
+        logicalPageGroupLru_.push_front(group.groupKey);
+        logicalPageGroupLruByKey_[group.groupKey] = logicalPageGroupLru_.begin();
+        for (const auto &memberKey : group.memberKeys) {
+            logicalPageGroupByMember_.emplace(memberKey, group.groupKey);
+        }
+        if (!group.parentGroupKey.empty()) {
+            ++logicalPageGroupChildrenCount_[group.parentGroupKey];
+        }
+        results[i] = MMC_OK;
+    }
+    return MMC_OK;
+}
+
+Result MmcMetaManager::PrepareLogicalPageGroupRemove(const std::string &key, std::vector<std::string> &memberKeys)
+{
+    std::lock_guard<std::mutex> guard(logicalPageGroupMutex_);
+    const auto memberIter = logicalPageGroupByMember_.find(key);
+    if (memberIter == logicalPageGroupByMember_.end()) {
+        return MMC_OK;
+    }
+
+    const auto groupIter = logicalPageGroups_.find(memberIter->second);
+    if (groupIter == logicalPageGroups_.end()) {
+        MMC_LOG_ERROR("Logical page group is missing for member=" << key);
+        return MMC_ERROR;
+    }
+    if (logicalPageGroupChildrenCount_[groupIter->first] != 0) {
+        MMC_LOG_DEBUG("Remove skip non-leaf logical page group=" << groupIter->first);
+        return MMC_UNMATCHED_STATE;
+    }
+    if (groupIter->second.removing || groupIter->second.moving) {
+        MMC_LOG_DEBUG("Remove skip logical page group being changed=" << groupIter->first);
+        return MMC_UNMATCHED_STATE;
+    }
+
+    memberKeys = groupIter->second.memberKeys;
+    groupIter->second.removing = true;
+    return MMC_OK;
+}
+
+Result MmcMetaManager::FinalizeLogicalPageGroupRemove(const std::string &key)
+{
+    std::lock_guard<std::mutex> guard(logicalPageGroupMutex_);
+    const auto memberIter = logicalPageGroupByMember_.find(key);
+    if (memberIter == logicalPageGroupByMember_.end()) {
+        return MMC_UNMATCHED_KEY;
+    }
+
+    const auto groupIter = logicalPageGroups_.find(memberIter->second);
+    if (groupIter == logicalPageGroups_.end() || !groupIter->second.removing) {
+        return MMC_UNMATCHED_STATE;
+    }
+    const auto memberKeys = groupIter->second.memberKeys;
+    if (!groupIter->second.parentGroupKey.empty()) {
+        auto parentChildrenIter = logicalPageGroupChildrenCount_.find(groupIter->second.parentGroupKey);
+        if (parentChildrenIter == logicalPageGroupChildrenCount_.end() || parentChildrenIter->second == 0) {
+            MMC_LOG_ERROR("Logical page group parent child count is invalid, group=" << groupIter->first);
+            return MMC_ERROR;
+        }
+        --parentChildrenIter->second;
+        if (parentChildrenIter->second == 0) {
+            logicalPageGroupChildrenCount_.erase(parentChildrenIter);
+        }
+    }
+    logicalPageGroupChildrenCount_.erase(groupIter->first);
+    for (const auto &memberKey : memberKeys) {
+        logicalPageGroupByMember_.erase(memberKey);
+    }
+    const auto lruIter = logicalPageGroupLruByKey_.find(groupIter->first);
+    if (lruIter != logicalPageGroupLruByKey_.end()) {
+        logicalPageGroupLru_.erase(lruIter->second);
+        logicalPageGroupLruByKey_.erase(lruIter);
+    }
+    logicalPageGroups_.erase(groupIter);
+    return MMC_OK;
+}
+
+void MmcMetaManager::AbortLogicalPageGroupRemove(const std::string &key)
+{
+    std::lock_guard<std::mutex> guard(logicalPageGroupMutex_);
+    const auto memberIter = logicalPageGroupByMember_.find(key);
+    if (memberIter == logicalPageGroupByMember_.end()) {
+        return;
+    }
+    const auto groupIter = logicalPageGroups_.find(memberIter->second);
+    if (groupIter != logicalPageGroups_.end()) {
+        groupIter->second.removing = false;
+    }
+}
+
+Result MmcMetaManager::PrepareLogicalPageGroupMove(const std::string &key, std::vector<std::string> &memberKeys)
+{
+    std::lock_guard<std::mutex> guard(logicalPageGroupMutex_);
+    const auto memberIter = logicalPageGroupByMember_.find(key);
+    if (memberIter == logicalPageGroupByMember_.end()) {
+        return MMC_UNMATCHED_KEY;
+    }
+    const auto groupIter = logicalPageGroups_.find(memberIter->second);
+    if (groupIter == logicalPageGroups_.end()) {
+        return MMC_ERROR;
+    }
+    if (groupIter->second.removing || groupIter->second.moving) {
+        return MMC_UNMATCHED_STATE;
+    }
+    memberKeys = groupIter->second.memberKeys;
+    groupIter->second.moving = true;
+    return MMC_OK;
+}
+
+void MmcMetaManager::CompleteLogicalPageGroupMove(const std::string &key)
+{
+    std::lock_guard<std::mutex> guard(logicalPageGroupMutex_);
+    const auto memberIter = logicalPageGroupByMember_.find(key);
+    if (memberIter == logicalPageGroupByMember_.end()) {
+        return;
+    }
+    const auto groupIter = logicalPageGroups_.find(memberIter->second);
+    if (groupIter != logicalPageGroups_.end()) {
+        groupIter->second.moving = false;
+    }
+}
+
+void MmcMetaManager::InvalidateLogicalPageGroup(const std::string &key)
+{
+    std::vector<std::string> groupsPostorder;
+    std::vector<std::string> memberKeys;
+    {
+        std::lock_guard<std::mutex> guard(logicalPageGroupMutex_);
+        const auto memberIter = logicalPageGroupByMember_.find(key);
+        if (memberIter == logicalPageGroupByMember_.end()) {
+            return;
+        }
+        const std::string rootGroupKey = memberIter->second;
+        std::function<void(const std::string &)> collectGroup = [this, &collectGroup, &groupsPostorder, &memberKeys](
+                                                                  const std::string &groupKey) {
+            for (const auto &[childGroupKey, childGroup] : logicalPageGroups_) {
+                if (childGroup.parentGroupKey == groupKey) {
+                    collectGroup(childGroupKey);
+                }
+            }
+            const auto groupIter = logicalPageGroups_.find(groupKey);
+            if (groupIter == logicalPageGroups_.end()) {
+                return;
+            }
+            groupIter->second.removing = true;
+            groupsPostorder.push_back(groupKey);
+            memberKeys.insert(memberKeys.end(), groupIter->second.memberKeys.begin(),
+                              groupIter->second.memberKeys.end());
+        };
+        collectGroup(rootGroupKey);
+    }
+
+    for (const auto &memberKey : memberKeys) {
+        (void)RemovePhysicalKey(memberKey);
+    }
+
+    std::lock_guard<std::mutex> guard(logicalPageGroupMutex_);
+    for (const auto &groupKey : groupsPostorder) {
+        const auto groupIter = logicalPageGroups_.find(groupKey);
+        if (groupIter == logicalPageGroups_.end()) {
+            continue;
+        }
+        if (!groupIter->second.parentGroupKey.empty()) {
+            auto parentCountIter = logicalPageGroupChildrenCount_.find(groupIter->second.parentGroupKey);
+            if (parentCountIter != logicalPageGroupChildrenCount_.end() && parentCountIter->second > 0) {
+                --parentCountIter->second;
+                if (parentCountIter->second == 0) {
+                    logicalPageGroupChildrenCount_.erase(parentCountIter);
+                }
+            }
+        }
+        logicalPageGroupChildrenCount_.erase(groupKey);
+        for (const auto &memberKey : groupIter->second.memberKeys) {
+            logicalPageGroupByMember_.erase(memberKey);
+        }
+        const auto lruIter = logicalPageGroupLruByKey_.find(groupKey);
+        if (lruIter != logicalPageGroupLruByKey_.end()) {
+            logicalPageGroupLru_.erase(lruIter->second);
+            logicalPageGroupLruByKey_.erase(lruIter);
+        }
+        logicalPageGroups_.erase(groupIter);
+    }
+}
+
+Result MmcMetaManager::RewarmLogicalPageGroup(const std::string &key, MediaType srcMedia, MediaType dstMedia)
+{
+    std::vector<std::string> memberKeys;
+    Result ret = PrepareLogicalPageGroupMove(key, memberKeys);
+    if (ret != MMC_OK) {
+        return ret;
+    }
+    ret = MoveLogicalPageGroup(memberKeys, srcMedia, dstMedia, false);
+    CompleteLogicalPageGroupMove(key);
+    return ret;
+}
+
+bool MmcMetaManager::IsLogicalPageGroupMember(const std::string &key) const
+{
+    std::lock_guard<std::mutex> guard(logicalPageGroupMutex_);
+    return logicalPageGroupByMember_.count(key) != 0;
+}
+
+void MmcMetaManager::PromoteLogicalPageGroup(const std::string &key)
+{
+    std::lock_guard<std::mutex> guard(logicalPageGroupMutex_);
+    const auto memberIter = logicalPageGroupByMember_.find(key);
+    if (memberIter == logicalPageGroupByMember_.end()) {
+        return;
+    }
+    const auto groupIter = logicalPageGroups_.find(memberIter->second);
+    const auto lruIter = logicalPageGroupLruByKey_.find(memberIter->second);
+    if (groupIter == logicalPageGroups_.end() || lruIter == logicalPageGroupLruByKey_.end() ||
+        groupIter->second.removing || groupIter->second.moving) {
+        return;
+    }
+    logicalPageGroupLru_.splice(logicalPageGroupLru_.begin(), logicalPageGroupLru_, lruIter->second);
+    lruIter->second = logicalPageGroupLru_.begin();
+}
+
+void MmcMetaManager::ClearLogicalPageGroups()
+{
+    std::lock_guard<std::mutex> guard(logicalPageGroupMutex_);
+    logicalPageGroups_.clear();
+    logicalPageGroupByMember_.clear();
+    logicalPageGroupChildrenCount_.clear();
+    logicalPageGroupLru_.clear();
+    logicalPageGroupLruByKey_.clear();
+}
+
 Result MmcMetaManager::RemoveAll()
 {
+    ClearLogicalPageGroups();
     auto removeFunc = [this](const std::string &key, const MmcMemObjMetaPtr &objMeta) -> void {
         if (objMeta == nullptr) {
             MMC_LOG_ERROR("objMeta is null in RemoveAll for key: " << key);
@@ -1930,8 +2368,10 @@ Result MmcMetaManager::RemoveBlobs(uint32_t rank, MediaType mediaType)
 
     std::atomic<uint64_t> freedBlobs{0};
     std::atomic<uint64_t> erasedKeys{0};
-    auto matchFunc = [this, &filter, &freedBlobs, &erasedKeys](const std::string &key,
-                                                               const MmcMemObjMetaPtr &objMeta) -> bool {
+    std::mutex erasedGroupKeysMutex;
+    std::vector<std::string> erasedGroupKeys;
+    auto matchFunc = [this, &filter, &freedBlobs, &erasedKeys, &erasedGroupKeysMutex,
+                      &erasedGroupKeys](const std::string &key, const MmcMemObjMetaPtr &objMeta) -> bool {
         if (objMeta == nullptr) {
             MMC_LOG_ERROR("objMeta is null for key:" << key);
             return false;
@@ -1945,6 +2385,8 @@ Result MmcMetaManager::RemoveBlobs(uint32_t rank, MediaType mediaType)
         const bool shouldErase = (objMeta->NumBlobs() == 0);
         if (shouldErase) {
             ++erasedKeys;
+            std::lock_guard<std::mutex> erasedKeysGuard(erasedGroupKeysMutex);
+            erasedGroupKeys.push_back(key);
         }
         return shouldErase;
     };
@@ -1952,6 +2394,9 @@ Result MmcMetaManager::RemoveBlobs(uint32_t rank, MediaType mediaType)
     TP_TRACE_BEGIN(TP_MMC_META_REMOVE_BLOBS);
     metaContainer_->EraseIf(matchFunc);
     TP_TRACE_END(TP_MMC_META_REMOVE_BLOBS, MMC_OK);
+    for (const auto &key : erasedGroupKeys) {
+        InvalidateLogicalPageGroup(key);
+    }
     KvEventCleared(rank, mediaType);
     MMC_LOG_TRACE("Remove blobs for rank=" << rank << ", media=" << static_cast<int>(mediaType) << " done, freedBlobs="
                                            << freedBlobs.load() << ", erasedKeys=" << erasedKeys.load());
@@ -1972,8 +2417,10 @@ Result MmcMetaManager::RemoveBlobsForDeadRank(uint32_t rank, MediaType mediaType
 
     std::atomic<uint64_t> droppedBlobs{0};
     std::atomic<uint64_t> erasedKeys{0};
-    auto matchFunc = [this, &filter, &droppedBlobs, &erasedKeys](const std::string &key,
-                                                                 const MmcMemObjMetaPtr &objMeta) -> bool {
+    std::mutex erasedGroupKeysMutex;
+    std::vector<std::string> erasedGroupKeys;
+    auto matchFunc = [this, &filter, &droppedBlobs, &erasedKeys, &erasedGroupKeysMutex,
+                      &erasedGroupKeys](const std::string &key, const MmcMemObjMetaPtr &objMeta) -> bool {
         if (objMeta == nullptr) {
             return false;
         }
@@ -1987,6 +2434,8 @@ Result MmcMetaManager::RemoveBlobsForDeadRank(uint32_t rank, MediaType mediaType
         const bool shouldErase = (objMeta->NumBlobs() == 0);
         if (shouldErase) {
             ++erasedKeys;
+            std::lock_guard<std::mutex> erasedKeysGuard(erasedGroupKeysMutex);
+            erasedGroupKeys.push_back(key);
         }
         return shouldErase;
     };
@@ -1994,6 +2443,9 @@ Result MmcMetaManager::RemoveBlobsForDeadRank(uint32_t rank, MediaType mediaType
     TP_TRACE_BEGIN(TP_MMC_META_REMOVE_BLOBS_DEAD);
     metaContainer_->EraseIf(matchFunc);
     TP_TRACE_END(TP_MMC_META_REMOVE_BLOBS_DEAD, MMC_OK);
+    for (const auto &key : erasedGroupKeys) {
+        InvalidateLogicalPageGroup(key);
+    }
     KvEventCleared(rank, mediaType);
     return MMC_OK;
 }
@@ -2004,6 +2456,9 @@ Result MmcMetaManager::Unmount(const MmcLocation &loc, bool deadRank)
     if (ret != MMC_OK) {
         return ret;
     }
+    // RemoveBlobs invalidates complete affected group subtrees after it learns
+    // which keys lost their final replica. Groups whose members retain another
+    // replica keep their prefix topology across the rank unmount.
     ret = deadRank ? RemoveBlobsForDeadRank(loc.rank_, loc.mediaType_) : RemoveBlobs(loc.rank_, loc.mediaType_);
     const Result removeBlobsRet = ret;
     if (removeBlobsRet != MMC_OK) {
@@ -2199,6 +2654,241 @@ Result MmcMetaManager::AsyncPrefetchKeys(const std::vector<std::string> &keys, c
     return MMC_OK;
 }
 
+Result MmcMetaManager::MoveLogicalPageGroup(const std::vector<std::string> &memberKeys, MediaType srcMedia,
+                                            MediaType dstMedia, bool removeSource)
+{
+    if (memberKeys.empty() || dstMedia == MEDIA_NONE) {
+        return MMC_INVALID_PARAM;
+    }
+
+    std::vector<LogicalPageGroupMoveEntry> entries;
+    entries.reserve(memberKeys.size());
+    uint64_t totalSize = 0;
+    for (const auto &memberKey : memberKeys) {
+        MmcMemObjMetaPtr meta;
+        if (metaContainer_->Get(memberKey, meta) != MMC_OK || meta == nullptr) {
+            return MMC_UNMATCHED_KEY;
+        }
+        std::lock_guard<std::mutex> guard(meta->Mutex());
+        MmcBlobFilterPtr filter = MmcMakeRef<MmcBlobFilter>(UINT32_MAX, srcMedia, READABLE);
+        if (filter == nullptr) {
+            return MMC_MALLOC_FAILED;
+        }
+        if (CheckActiveLease(memberKey, meta, filter)) {
+            return MMC_UNMATCHED_STATE;
+        }
+        std::vector<MmcMemBlobDesc> srcBlobs;
+        meta->GetBlobsDesc(srcBlobs, filter);
+        if (srcBlobs.empty()) {
+            return MMC_UNMATCHED_KEY;
+        }
+        totalSize += srcBlobs.front().size_;
+        entries.push_back({memberKey, meta, srcBlobs.front(), nullptr});
+    }
+    if (globalAllocator_->GetFreeSpace(dstMedia) < totalSize) {
+        return MMC_MALLOC_FAILED;
+    }
+    if (metaNetServer_ == nullptr) {
+        return MMC_NOT_INITIALIZED;
+    }
+
+    auto rollbackStagedBlobs = [this, &entries]() {
+        std::vector<MmcMemBlobPtr> stagedBlobs;
+        for (const auto &entry : entries) {
+            if (entry.dstBlob != nullptr) {
+                stagedBlobs.push_back(entry.dstBlob);
+            }
+        }
+        if (!stagedBlobs.empty()) {
+            globalAllocator_->Free(stagedBlobs);
+        }
+    };
+
+    std::map<uint32_t, BatchRpcData> copyBatches;
+    for (size_t index = 0; index < entries.size(); ++index) {
+        auto &entry = entries[index];
+        AllocOptions allocOpt{entry.srcDesc.size_, kSingleBlobCount, static_cast<uint16_t>(dstMedia), {}, 0U};
+        std::vector<MmcMemBlobPtr> dstBlobs;
+        Result ret = globalAllocator_->Alloc(allocOpt, dstBlobs);
+        if (ret != MMC_OK || dstBlobs.empty()) {
+            rollbackStagedBlobs();
+            return MMC_MALLOC_FAILED;
+        }
+        entry.dstBlob = dstBlobs.front();
+        auto &batch = copyBatches[entry.dstBlob->GetDesc().rank_];
+        batch.keys.push_back(entry.key);
+        batch.srcBlobs.push_back(entry.srcDesc);
+        batch.dstBlobs.push_back(entry.dstBlob->GetDesc());
+        batch.groupIndices.push_back(index);
+    }
+
+    std::vector<bool> copyOk(entries.size(), false);
+    for (auto &[rank, batch] : copyBatches) {
+        if (SendBatchRpc(rank, batch, copyOk) != MMC_OK) {
+            rollbackStagedBlobs();
+            return MMC_ERROR;
+        }
+    }
+    if (std::find(copyOk.begin(), copyOk.end(), false) != copyOk.end()) {
+        rollbackStagedBlobs();
+        return MMC_ERROR;
+    }
+
+    std::vector<std::unique_lock<std::mutex>> metaLocks;
+    metaLocks.reserve(entries.size());
+    for (auto &entry : entries) {
+        metaLocks.emplace_back(entry.meta->Mutex());
+    }
+
+    std::vector<bool> dstAdded(entries.size(), false);
+    auto rollbackCommittedBlobs = [this, &entries, &dstAdded, &metaLocks, dstMedia]() {
+        std::vector<std::vector<MmcMemBlobPtr>> attachedBlobs(entries.size());
+        std::vector<MmcMemBlobPtr> unattachedBlobs;
+        for (size_t index = 0; index < entries.size(); ++index) {
+            auto &entry = entries[index];
+            if (!dstAdded[index]) {
+                unattachedBlobs.push_back(entry.dstBlob);
+                continue;
+            }
+            MmcBlobFilterPtr dstFilter =
+                MmcMakeRef<MmcBlobFilter>(entry.dstBlob->GetDesc().rank_, dstMedia, NONE);
+            if (dstFilter != nullptr) {
+                attachedBlobs[index] = entry.meta->DetachBlobs(dstFilter);
+            }
+        }
+        for (auto &lock : metaLocks) {
+            lock.unlock();
+        }
+        for (size_t index = 0; index < entries.size(); ++index) {
+            if (!attachedBlobs[index].empty()) {
+                entries[index].meta->FinalizeBlobs(entries[index].key, globalAllocator_, attachedBlobs[index], false);
+            }
+        }
+        if (!unattachedBlobs.empty()) {
+            globalAllocator_->Free(unattachedBlobs);
+        }
+    };
+
+    std::vector<std::vector<MmcMemBlobPtr>> srcBlobs(entries.size());
+    for (size_t index = 0; index < entries.size(); ++index) {
+        auto &entry = entries[index];
+        MmcBlobFilterPtr srcFilter = MmcMakeRef<MmcBlobFilter>(UINT32_MAX, srcMedia, READABLE);
+        if (srcFilter == nullptr || entry.meta->GetBlobs(srcFilter).empty()) {
+            rollbackStagedBlobs();
+            return MMC_UNMATCHED_KEY;
+        }
+        if (CheckActiveLease(entry.key, entry.meta, srcFilter)) {
+            rollbackStagedBlobs();
+            return MMC_UNMATCHED_STATE;
+        }
+    }
+    for (size_t index = 0; index < entries.size(); ++index) {
+        auto &entry = entries[index];
+        Result ret = entry.dstBlob->UpdateState(entry.key, entry.dstBlob->GetDesc().rank_, 0U, MMC_WRITE_OK);
+        if (ret != MMC_OK || entry.meta->AddBlob(entry.dstBlob) != MMC_OK) {
+            rollbackCommittedBlobs();
+            return ret == MMC_OK ? MMC_ERROR : ret;
+        }
+        dstAdded[index] = true;
+    }
+    if (removeSource) {
+        for (size_t index = 0; index < entries.size(); ++index) {
+            MmcBlobFilterPtr srcFilter = MmcMakeRef<MmcBlobFilter>(UINT32_MAX, srcMedia, NONE);
+            srcBlobs[index] = entries[index].meta->DetachBlobs(srcFilter);
+        }
+    }
+    for (auto &lock : metaLocks) {
+        lock.unlock();
+    }
+    for (size_t index = 0; index < entries.size(); ++index) {
+        auto &entry = entries[index];
+        if (removeSource) {
+            entry.meta->FinalizeBlobs(entry.key, globalAllocator_, srcBlobs[index]);
+            for (const auto &srcBlob : srcBlobs[index]) {
+                if (srcBlob != nullptr) {
+                    KvEventRemoved(entry.key, srcBlob->Rank(), srcBlob->Type());
+                }
+            }
+        }
+        KvEventStored(entry.key, entry.dstBlob->GetDesc().rank_, entry.dstBlob->GetDesc().mediaType_);
+        metaContainer_->InsertLru(entry.key, dstMedia);
+    }
+    return MMC_OK;
+}
+
+Result MmcMetaManager::EvictLogicalPageGroup(const std::string &key, MediaType srcMedia, size_t &evictedMemberCount)
+{
+    evictedMemberCount = 0;
+    std::vector<std::string> memberKeys;
+    Result ret = PrepareLogicalPageGroupRemove(key, memberKeys);
+    if (ret != MMC_OK || memberKeys.empty()) {
+        return ret == MMC_OK ? MMC_UNMATCHED_KEY : ret;
+    }
+
+    const MediaType dstMedia = MoveDown(srcMedia);
+    if (dstMedia != MEDIA_NONE) {
+        ret = MoveLogicalPageGroup(memberKeys, srcMedia, dstMedia, true);
+        if (ret == MMC_OK) {
+            AbortLogicalPageGroupRemove(key);
+            evictedMemberCount = memberKeys.size();
+            return MMC_OK;
+        }
+        // A failed copy must leave the complete source group intact. Final
+        // removal is only allowed when the lower tier cannot hold the group.
+        if (ret != MMC_MALLOC_FAILED) {
+            AbortLogicalPageGroupRemove(key);
+            return ret;
+        }
+    }
+
+    std::vector<std::pair<std::string, MmcMemObjMetaPtr>> removedMetas;
+    ret = metaContainer_->EraseBatch(memberKeys, removedMetas);
+    if (ret != MMC_OK) {
+        AbortLogicalPageGroupRemove(key);
+        return ret;
+    }
+    ret = FinalizeLogicalPageGroupRemove(key);
+    if (ret != MMC_OK) {
+        MMC_LOG_ERROR("Evict logical page group finalization failed, key=" << key << ", ret=" << ret);
+    }
+    for (const auto &[memberKey, objMeta] : removedMetas) {
+        std::unique_lock<std::mutex> guard(objMeta->Mutex());
+        PushRemoveList(memberKey, objMeta, nullptr, false);
+    }
+    evictedMemberCount = removedMetas.size();
+    return ret;
+}
+
+size_t MmcMetaManager::EvictLogicalPageGroups(MediaType media, size_t targetMemberCount)
+{
+    if (media == MEDIA_NONE || media == MEDIA_SSD || targetMemberCount == 0) {
+        return 0;
+    }
+
+    std::vector<std::string> candidateKeys;
+    {
+        std::lock_guard<std::mutex> guard(logicalPageGroupMutex_);
+        candidateKeys.reserve(logicalPageGroupLru_.size());
+        for (auto groupIter = logicalPageGroupLru_.rbegin(); groupIter != logicalPageGroupLru_.rend(); ++groupIter) {
+            const auto logicalGroupIter = logicalPageGroups_.find(*groupIter);
+            if (logicalGroupIter != logicalPageGroups_.end() && !logicalGroupIter->second.memberKeys.empty()) {
+                candidateKeys.push_back(logicalGroupIter->second.memberKeys.front());
+            }
+        }
+    }
+    size_t evictedMemberCount = 0;
+    for (const auto &candidateKey : candidateKeys) {
+        if (evictedMemberCount >= targetMemberCount) {
+            continue;
+        }
+        size_t groupMemberCount = 0;
+        if (EvictLogicalPageGroup(candidateKey, media, groupMemberCount) == MMC_OK) {
+            evictedMemberCount += groupMemberCount;
+        }
+    }
+    return evictedMemberCount;
+}
+
 Result MmcMetaManager::EvictKeys(std::vector<std::string> keys, MediaType srcMedia, MediaType dstMedia, uint32_t flags)
 {
     (void)flags;
@@ -2213,6 +2903,14 @@ Result MmcMetaManager::EvictKeys(std::vector<std::string> keys, MediaType srcMed
         return MMC_INVALID_PARAM;
     }
     for (const auto &key : keys) {
+        if (IsLogicalPageGroupMember(key)) {
+            size_t evictedMemberCount = 0;
+            const Result groupRet = EvictLogicalPageGroup(key, srcMedia, evictedMemberCount);
+            if (groupRet != MMC_OK) {
+                MMC_LOG_INFO("EvictKeys skip logical page group member, key=" << key << ", ret=" << groupRet);
+            }
+            continue;
+        }
         MmcMemObjMetaPtr objMeta;
         auto ret = metaContainer_->Get(key, objMeta);
         if (ret != MMC_OK || objMeta == nullptr) {
@@ -2244,6 +2942,7 @@ Result MmcMetaManager::Query(const std::string &key, uint64_t operateId, uint32_
         MMC_LOG_ERROR("Query key: " << key << " Promote failed. ErrCode: " << ret);
         return ret;
     }
+    PromoteLogicalPageGroup(key);
 
     std::unique_lock<std::mutex> guard(objMeta->Mutex());
     std::vector<MmcMemBlobDesc> blobs;
@@ -2290,6 +2989,7 @@ Result MmcMetaManager::AddLease(const std::string &key, uint64_t operateId, uint
         MMC_LOG_ERROR("AddLease key: " << key << " Promote failed. ErrCode: " << ret);
         return ret;
     }
+    PromoteLogicalPageGroup(key);
 
     std::unique_lock<std::mutex> guard(objMeta->Mutex());
     std::vector<MmcMemBlobPtr> blobs = objMeta->GetBlobs();
@@ -2589,6 +3289,14 @@ EvictResult MmcMetaManager::EvictCallBackFunction(const std::string &key, const 
 {
     if (objMeta == nullptr) {
         MMC_LOG_ERROR("objMeta is null");
+        return EvictResult::FAIL;
+    }
+
+    // MetaContainer invokes this callback while holding its own eviction lock.
+    // Grouped members are handled by the leaf-first pre-pass, which can reserve
+    // the whole group before re-entering the container for the atomic commit.
+    if (IsLogicalPageGroupMember(key)) {
+        MMC_LOG_DEBUG("Evict skip logical page group member=" << key);
         return EvictResult::FAIL;
     }
 

@@ -84,6 +84,9 @@ Result ock::mmc::MetaNetServer::Start(NetEngineOptions &options)
                                       std::bind(&MetaNetServer::HandleBatchUpdateLease, this, std::placeholders::_1));
     server->RegRequestReceivedHandler(LOCAL_META_OPCODE_REQ::ML_BATCH_ALLOC_REQ,
                                       std::bind(&MetaNetServer::HandleBatchAlloc, this, std::placeholders::_1));
+    server->RegRequestReceivedHandler(LOCAL_META_OPCODE_REQ::ML_REGISTER_LOGICAL_PAGE_GROUPS_REQ,
+                                      std::bind(&MetaNetServer::HandleRegisterLogicalPageGroups, this,
+                                                std::placeholders::_1));
     server->RegRequestReceivedHandler(LOCAL_META_OPCODE_REQ::LM_PING_REQ, nullptr);
     server->RegRequestReceivedHandler(LOCAL_META_OPCODE_REQ::LM_META_REPLICATE_REQ, nullptr);
     server->RegRequestReceivedHandler(LOCAL_META_OPCODE_REQ::LM_BLOB_COPY_REQ, nullptr);
@@ -241,6 +244,21 @@ Result MetaNetServer::HandleBatchAlloc(const NetContextPtr &context)
     TP_TRACE_END(TP_MMC_META_BATCH_PUT, batchResult);
     if (batchResult != MMC_OK) {
         MMC_LOG_ERROR("BatchAlloc failed. Keys count: " << req.keys_.size() << ", Error: " << batchResult);
+    }
+    return context->Reply(req.msgId, resp);
+}
+
+Result MetaNetServer::HandleRegisterLogicalPageGroups(const NetContextPtr &context)
+{
+    RegisterLogicalPageGroupsRequest req;
+    RegisterLogicalPageGroupsResponse resp;
+    Result ret = context->GetRequest<RegisterLogicalPageGroupsRequest>(req);
+    if (ret != MMC_OK) {
+        return ret;
+    }
+    ret = metaService_->GetMetaMgrProxy().RegisterLogicalPageGroups(req, resp);
+    if (ret != MMC_OK) {
+        MMC_LOG_ERROR("RegisterLogicalPageGroups failed, groups=" << req.groupKeys_.size() << ", ret=" << ret);
     }
     return context->Reply(req.msgId, resp);
 }

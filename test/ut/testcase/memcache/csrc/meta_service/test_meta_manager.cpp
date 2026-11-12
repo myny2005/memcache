@@ -474,6 +474,140 @@ TEST_F(TestMmcMetaManager, AllocAndFree)
     metaMng->Stop();
 }
 
+TEST_F(TestMmcMetaManager, RemoveLogicalPageGroupRemovesAllMembersAndProtectsParent)
+{
+    constexpr uint32_t rank = 0U;
+    constexpr uint32_t shardCount = 2U;
+    constexpr uint32_t evictYieldDurationUs = 100U;
+    const MmcLocation loc{rank, MEDIA_DRAM};
+    const MmcLocalMemlInitInfo locInfo{0U, 1000000U};
+    const AllocOptions allocReq{SIZE_32K, 1U, MEDIA_DRAM, {rank}, ALLOC_FORCE_BY_RANK};
+    const uint64_t operateId = GenerateOperateId(rank);
+    const std::vector<std::string> parentMembers{"page_a_k", "page_a_v"};
+    const std::vector<std::string> childMembers{"page_b_k", "page_b_v"};
+
+    auto metaMng = MmcMakeRef<MmcMetaManager>(2000U, 70U, 60U, MmcMetaExtConfig{}, 0U, evictYieldDurationUs,
+                                               shardCount, MetaLruType::SHARDED_LRU);
+    ASSERT_EQ(metaMng->Start(), MMC_OK);
+    std::vector<std::pair<std::string, MmcMemBlobDesc>> blobMap;
+    ASSERT_EQ(metaMng->Mount(loc, locInfo, blobMap), MMC_OK);
+
+    for (const auto &key : {parentMembers[0], parentMembers[1], childMembers[0], childMembers[1]}) {
+        MmcMemMetaDesc desc;
+        ASSERT_EQ(metaMng->Alloc(key, allocReq, operateId, 0, desc), MMC_OK);
+        ASSERT_EQ(metaMng->UpdateState(key, loc, MMC_WRITE_OK, operateId), MMC_OK);
+    }
+
+    ASSERT_EQ(metaMng->RegisterLogicalPageGroup({"page_a", "", parentMembers}), MMC_OK);
+    ASSERT_EQ(metaMng->RegisterLogicalPageGroup({"page_b", "page_a", childMembers}), MMC_OK);
+
+    EXPECT_EQ(metaMng->Remove(parentMembers[0]), MMC_UNMATCHED_STATE);
+    EXPECT_EQ(metaMng->ExistKey(parentMembers[0]), MMC_OK);
+
+    ASSERT_EQ(metaMng->EvictKey(childMembers[0]), MMC_OK);
+    EXPECT_EQ(metaMng->ExistKey(childMembers[0]), MMC_UNMATCHED_KEY);
+    EXPECT_EQ(metaMng->ExistKey(childMembers[1]), MMC_UNMATCHED_KEY);
+
+    ASSERT_EQ(metaMng->Remove(parentMembers[1]), MMC_OK);
+    EXPECT_EQ(metaMng->ExistKey(parentMembers[0]), MMC_UNMATCHED_KEY);
+    EXPECT_EQ(metaMng->ExistKey(parentMembers[1]), MMC_UNMATCHED_KEY);
+    metaMng->Stop();
+}
+
+TEST_F(TestMmcMetaManager, AutomaticEvictionRemovesLeafLogicalPageGroup)
+{
+    constexpr uint32_t rank = 0U;
+    constexpr uint64_t capacity = SIZE_32K * 5U;
+    const MmcLocation loc{rank, MEDIA_DRAM};
+    const MmcLocalMemlInitInfo locInfo{0U, capacity};
+    const AllocOptions allocReq{SIZE_32K, 1U, MEDIA_DRAM, {rank}, ALLOC_FORCE_BY_RANK};
+    const uint64_t operateId = GenerateOperateId(rank);
+    const std::vector<std::string> parentMembers{"auto_page_a_k", "auto_page_a_v"};
+    const std::vector<std::string> childMembers{"auto_page_b_k", "auto_page_b_v"};
+    const auto evictionDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+
+    auto metaMng = MmcMakeRef<MmcMetaManager>(2000U, 70U, 60U);
+    ASSERT_EQ(metaMng->Start(), MMC_OK);
+    std::vector<std::pair<std::string, MmcMemBlobDesc>> blobMap;
+    ASSERT_EQ(metaMng->Mount(loc, locInfo, blobMap), MMC_OK);
+    for (const auto &key : {parentMembers[0], parentMembers[1], childMembers[0], childMembers[1]}) {
+        MmcMemMetaDesc desc;
+        ASSERT_EQ(metaMng->Alloc(key, allocReq, operateId, 0, desc), MMC_OK);
+        ASSERT_EQ(metaMng->UpdateState(key, loc, MMC_WRITE_OK, operateId), MMC_OK);
+    }
+    ASSERT_EQ(metaMng->RegisterLogicalPageGroup({"auto_page_a", "", parentMembers}), MMC_OK);
+    ASSERT_EQ(metaMng->RegisterLogicalPageGroup({"auto_page_b", "auto_page_a", childMembers}), MMC_OK);
+
+    metaMng->CheckAndEvict(MEDIA_DRAM, 0U);
+    while (metaMng->ExistKey(childMembers[0]) != MMC_UNMATCHED_KEY &&
+           std::chrono::steady_clock::now() < evictionDeadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    EXPECT_EQ(metaMng->ExistKey(childMembers[0]), MMC_UNMATCHED_KEY);
+    EXPECT_EQ(metaMng->ExistKey(childMembers[1]), MMC_UNMATCHED_KEY);
+    EXPECT_EQ(metaMng->ExistKey(parentMembers[0]), MMC_OK);
+    EXPECT_EQ(metaMng->ExistKey(parentMembers[1]), MMC_OK);
+    metaMng->Stop();
+}
+
+TEST_F(TestMmcMetaManager, RegisterLogicalPageGroupsCommitsOrderedBatchAtomically)
+{
+    constexpr uint32_t rank = 0U;
+    const MmcLocation loc{rank, MEDIA_DRAM};
+    const MmcLocalMemlInitInfo locInfo{0U, 1000000U};
+    const AllocOptions allocReq{SIZE_32K, 1U, MEDIA_DRAM, {rank}, ALLOC_FORCE_BY_RANK};
+    const uint64_t operateId = GenerateOperateId(rank);
+    const std::vector<std::string> rootMembers{"batch_root_k", "batch_root_v"};
+    const std::vector<std::string> leafMembers{"batch_leaf_k", "batch_leaf_v"};
+    const std::vector<std::string> invalidMembers{"batch_invalid_k", "batch_invalid_v"};
+    const std::vector<std::string> abortedRootMembers{"aborted_root_k", "aborted_root_v"};
+    const std::vector<std::string> abortedLeafMembers{"aborted_leaf_k", "aborted_leaf_v"};
+
+    auto metaMng = MmcMakeRef<MmcMetaManager>(2000U, 70U, 60U);
+    ASSERT_EQ(metaMng->Start(), MMC_OK);
+    std::vector<std::pair<std::string, MmcMemBlobDesc>> blobMap;
+    ASSERT_EQ(metaMng->Mount(loc, locInfo, blobMap), MMC_OK);
+    for (const auto &key : {rootMembers[0], rootMembers[1], leafMembers[0], leafMembers[1], invalidMembers[0],
+                            invalidMembers[1], abortedRootMembers[0], abortedRootMembers[1], abortedLeafMembers[0],
+                            abortedLeafMembers[1]}) {
+        MmcMemMetaDesc desc;
+        ASSERT_EQ(metaMng->Alloc(key, allocReq, operateId, 0U, desc), MMC_OK);
+        ASSERT_EQ(metaMng->UpdateState(key, loc, MMC_WRITE_OK, operateId), MMC_OK);
+    }
+
+    std::vector<Result> results;
+    ASSERT_EQ(metaMng->RegisterLogicalPageGroups({{"batch_root", "", rootMembers},
+                                                   {"batch_leaf", "batch_root", leafMembers}},
+                                                  results),
+              MMC_OK);
+    ASSERT_EQ(results.size(), 2U);
+    EXPECT_EQ(results[0], MMC_OK);
+    EXPECT_EQ(results[1], MMC_OK);
+    // A client can lose the RPC response after the server commits the graph.
+    // Retrying the identical ordered batch must not turn that into a failure.
+    ASSERT_EQ(metaMng->RegisterLogicalPageGroups({{"batch_root", "", rootMembers},
+                                                   {"batch_leaf", "batch_root", leafMembers}},
+                                                  results),
+              MMC_OK);
+    ASSERT_EQ(results.size(), 2U);
+    EXPECT_EQ(results[0], MMC_OK);
+    EXPECT_EQ(results[1], MMC_OK);
+    EXPECT_EQ(metaMng->Remove(rootMembers[0]), MMC_UNMATCHED_STATE);
+
+    ASSERT_EQ(metaMng->RegisterLogicalPageGroups({{"batch_invalid", "unknown_parent", invalidMembers}}, results),
+              MMC_UNMATCHED_KEY);
+    ASSERT_EQ(metaMng->RegisterLogicalPageGroup({"batch_invalid", "", invalidMembers}), MMC_OK);
+
+    ASSERT_EQ(metaMng->RegisterLogicalPageGroups({{"aborted_root", "", abortedRootMembers},
+                                                   {"aborted_leaf", "unknown_parent", abortedLeafMembers}},
+                                                  results),
+              MMC_UNMATCHED_KEY);
+    // The valid first descriptor above must not leak through a failed atomic batch.
+    ASSERT_EQ(metaMng->RegisterLogicalPageGroup({"aborted_root", "", abortedRootMembers}), MMC_OK);
+    metaMng->Stop();
+}
+
 TEST_F(TestMmcMetaManager, AllocUsesPerRequestLeaseTtl)
 {
     MmcLocation loc{0, MEDIA_DRAM};

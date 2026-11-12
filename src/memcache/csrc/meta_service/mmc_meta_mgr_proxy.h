@@ -91,6 +91,9 @@ public:
 
     Result BatchAlloc(const BatchAllocRequest &req, BatchAllocResponse &resp);
 
+    Result RegisterLogicalPageGroups(const RegisterLogicalPageGroupsRequest &req,
+                                     RegisterLogicalPageGroupsResponse &resp);
+
     Result UpdateState(const UpdateRequest &req, Response &resp);
 
     Result BatchUpdateState(const BatchUpdateRequest &req, BatchUpdateResponse &resp);

@@ -25,6 +25,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace ock {
 namespace mmc {
@@ -468,6 +470,109 @@ Result MmcClientDefault::BatchPut(const std::vector<std::string> &keys, const st
         MMC_LOG_ERROR("client " << name_ << " batch put failed: " << ret);
     }
     return ret;
+}
+
+Result MmcClientDefault::BatchPutWithLogicalGroups(const std::vector<std::string> &keys,
+                                                    const std::vector<std::string> &groupKeys,
+                                                    const std::vector<std::string> &parentGroupKeys,
+                                                    const std::vector<mmc_buffer> &bufs, mmc_put_options &options,
+                                                    uint32_t flags, std::vector<int> &batchResult)
+{
+    if (keys.empty() || keys.size() != groupKeys.size() || keys.size() != parentGroupKeys.size() ||
+        keys.size() != bufs.size()) {
+        return MMC_INVALID_PARAM;
+    }
+    std::unordered_map<std::string, std::string> parentByGroup;
+    std::unordered_set<std::string> uniqueMemberKeys;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (keys[i].empty() || groupKeys[i].empty() || groupKeys[i] == parentGroupKeys[i] ||
+            !uniqueMemberKeys.insert(keys[i]).second) {
+            return MMC_INVALID_PARAM;
+        }
+        const auto [parentIter, inserted] = parentByGroup.emplace(groupKeys[i], parentGroupKeys[i]);
+        if (!inserted && parentIter->second != parentGroupKeys[i]) {
+            return MMC_INVALID_PARAM;
+        }
+    }
+
+    Result putRet = BatchPut(keys, bufs, options, flags, batchResult);
+    if (putRet != MMC_OK) {
+        return putRet;
+    }
+
+    std::vector<std::string> registeredGroupKeys;
+    std::vector<std::string> registeredParentGroupKeys;
+    std::vector<std::vector<std::string>> registeredMemberKeys;
+    std::unordered_map<std::string, size_t> groupIndices;
+    std::vector<bool> groupHasWriteFailure;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (groupKeys[i].empty() || groupKeys[i] == parentGroupKeys[i]) {
+            batchResult[i] = MMC_INVALID_PARAM;
+            continue;
+        }
+        auto [groupIter, inserted] = groupIndices.emplace(groupKeys[i], registeredGroupKeys.size());
+        if (inserted) {
+            registeredGroupKeys.push_back(groupKeys[i]);
+            registeredParentGroupKeys.push_back(parentGroupKeys[i]);
+            registeredMemberKeys.emplace_back();
+            groupHasWriteFailure.push_back(false);
+        } else if (registeredParentGroupKeys[groupIter->second] != parentGroupKeys[i]) {
+            batchResult[i] = MMC_INVALID_PARAM;
+            groupHasWriteFailure[groupIter->second] = true;
+        }
+        registeredMemberKeys[groupIter->second].push_back(keys[i]);
+        if (batchResult[i] != MMC_OK) {
+            groupHasWriteFailure[groupIter->second] = true;
+        }
+    }
+
+    std::vector<std::string> commitGroupKeys;
+    std::vector<std::string> commitParentGroupKeys;
+    std::vector<std::vector<std::string>> commitMemberKeys;
+    std::vector<size_t> commitGroupIndices;
+    for (size_t i = 0; i < registeredGroupKeys.size(); ++i) {
+        if (!groupHasWriteFailure[i]) {
+            commitGroupKeys.push_back(registeredGroupKeys[i]);
+            commitParentGroupKeys.push_back(registeredParentGroupKeys[i]);
+            commitMemberKeys.push_back(registeredMemberKeys[i]);
+            commitGroupIndices.push_back(i);
+        }
+    }
+    if (commitGroupKeys.empty()) {
+        return MMC_OK;
+    }
+
+    RegisterLogicalPageGroupsRequest request(commitGroupKeys, commitParentGroupKeys, commitMemberKeys);
+    RegisterLogicalPageGroupsResponse response;
+    Result commitRet = metaNetClient_->SyncCall(request, response, rpcRetryTimeOut_);
+    if (commitRet != MMC_OK || response.results_.size() != commitGroupKeys.size()) {
+        return commitRet == MMC_OK ? MMC_ERROR : commitRet;
+    }
+    bool commitFailed = false;
+    for (size_t i = 0; i < response.results_.size(); ++i) {
+        if (response.results_[i] == MMC_OK) {
+            continue;
+        }
+        commitFailed = true;
+        const size_t originalGroupIndex = commitGroupIndices[i];
+        for (size_t keyIndex = 0; keyIndex < keys.size(); ++keyIndex) {
+            if (groupIndices[groupKeys[keyIndex]] == originalGroupIndex && batchResult[keyIndex] == MMC_OK) {
+                batchResult[keyIndex] = response.results_[i];
+            }
+        }
+    }
+    if (commitFailed) {
+        std::vector<std::string> keysToRemove;
+        for (const auto &memberKeys : commitMemberKeys) {
+            keysToRemove.insert(keysToRemove.end(), memberKeys.begin(), memberKeys.end());
+        }
+        std::vector<Result> removeResults(keysToRemove.size(), MMC_ERROR);
+        const Result removeRet = BatchRemove(keysToRemove, removeResults, 0U);
+        if (removeRet != MMC_OK) {
+            MMC_LOG_ERROR("BatchPutWithLogicalGroups rollback failed, ret=" << removeRet);
+        }
+    }
+    return MMC_OK;
 }
 
 Result MmcClientDefault::Get(const char *key, mmc_buffer *buf, uint32_t flags)

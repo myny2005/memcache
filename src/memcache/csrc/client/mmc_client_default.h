@@ -75,6 +75,12 @@ public:
     Result BatchPut(const std::vector<std::string> &keys, const std::vector<MmcBufferArray> &bufArrs,
                     mmc_put_options &options, uint32_t flags, std::vector<int> &batchResult);
 
+    Result BatchPutWithLogicalGroups(const std::vector<std::string> &keys,
+                                     const std::vector<std::string> &groupKeys,
+                                     const std::vector<std::string> &parentGroupKeys,
+                                     const std::vector<mmc_buffer> &bufs, mmc_put_options &options, uint32_t flags,
+                                     std::vector<int> &batchResult);
+
     Result BatchGet(const std::vector<std::string> &keys, const std::vector<MmcBufferArray> &bufArrs, uint32_t flags,
                     std::vector<int> &batchResult);
 

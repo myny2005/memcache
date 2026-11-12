@@ -434,6 +434,18 @@ Result list, each element represents the result of the corresponding write opera
 - `0`: Success
 - Other: Error
 
+#### batch_put_from_with_groups
+
+```python
+result = store.batch_put_from_with_groups(
+    keys, group_keys, parent_group_keys, buffer_ptrs, sizes,
+    direct=memcache_hybrid.H2G, replicateConfig=defaultConfig)
+```
+
+Writes physical KV components and commits their logical page groups. `group_keys` identifies the logical page for
+each physical key (for example its K/V pair); `parent_group_keys` identifies the parent page or uses an empty string
+for a root page. A logical page becomes evictable only as a complete leaf group.
+
 #### put_from_layers
 
 ```python

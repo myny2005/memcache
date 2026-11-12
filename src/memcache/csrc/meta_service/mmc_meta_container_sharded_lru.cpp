@@ -68,6 +68,57 @@ public:
         return ShardOf(key).Erase(key, value);
     }
 
+    Result EraseBatch(const std::vector<Key> &keys, std::vector<std::pair<Key, Value>> &values) override
+    {
+        values.clear();
+        if (keys.empty()) {
+            return MMC_INVALID_PARAM;
+        }
+
+        std::vector<std::vector<Key>> shardKeys(shards_.size());
+        std::unordered_set<Key> uniqueKeys;
+        uniqueKeys.reserve(keys.size());
+        for (const auto &key : keys) {
+            if (!uniqueKeys.insert(key).second) {
+                return MMC_INVALID_PARAM;
+            }
+            shardKeys[ShardIndex(key)].push_back(key);
+        }
+
+        std::vector<size_t> involvedShards;
+        involvedShards.reserve(shards_.size());
+        for (size_t shard = 0; shard < shardKeys.size(); ++shard) {
+            if (!shardKeys[shard].empty()) {
+                involvedShards.push_back(shard);
+            }
+        }
+        BatchEraseGuard guard(shards_, involvedShards);
+
+        std::vector<std::pair<Key, Value>> removedValues;
+        removedValues.reserve(keys.size());
+        for (const size_t shard : involvedShards) {
+            for (const auto &key : shardKeys[shard]) {
+                const auto iter = shards_[shard]->metaMap_.find(key);
+                if (iter == shards_[shard]->metaMap_.end()) {
+                    return MMC_UNMATCHED_KEY;
+                }
+                removedValues.emplace_back(iter->first, iter->second.value_);
+            }
+        }
+
+        for (const size_t shard : involvedShards) {
+            for (const auto &key : shardKeys[shard]) {
+                const auto iter = shards_[shard]->metaMap_.find(key);
+                if (iter->second.mediaType_ != MEDIA_NONE) {
+                    shards_[shard]->lruLists_[iter->second.mediaType_].erase(iter->second.lruIter_);
+                }
+                shards_[shard]->metaMap_.erase(iter);
+            }
+        }
+        values = std::move(removedValues);
+        return MMC_OK;
+    }
+
     Result EraseIfEmpty(const Key &key, std::function<bool(const Value &)> isEmptyFunc) override
     {
         return ShardOf(key).EraseIfEmpty(key, isEmptyFunc);
@@ -368,6 +419,38 @@ public:
     }
 
 private:
+    class BatchEraseGuard {
+    public:
+        BatchEraseGuard(std::vector<std::unique_ptr<MmcMetaContainerLRU<Key, Value>>> &shards,
+                        const std::vector<size_t> &involvedShards)
+            : shards_(shards), involvedShards_(involvedShards)
+        {
+            for (const size_t shard : involvedShards_) {
+                shards_[shard]->metaLock_.LockWrite();
+            }
+            for (const size_t shard : involvedShards_) {
+                shards_[shard]->lruLock_.LockWrite();
+            }
+        }
+
+        ~BatchEraseGuard()
+        {
+            for (auto iter = involvedShards_.rbegin(); iter != involvedShards_.rend(); ++iter) {
+                shards_[*iter]->lruLock_.UnLock();
+            }
+            for (auto iter = involvedShards_.rbegin(); iter != involvedShards_.rend(); ++iter) {
+                shards_[*iter]->metaLock_.UnLock();
+            }
+        }
+
+        BatchEraseGuard(const BatchEraseGuard &) = delete;
+        BatchEraseGuard &operator=(const BatchEraseGuard &) = delete;
+
+    private:
+        std::vector<std::unique_ptr<MmcMetaContainerLRU<Key, Value>>> &shards_;
+        const std::vector<size_t> &involvedShards_;
+    };
+
     using Candidate = typename MmcMetaContainerLRU<Key, Value>::EvictionCandidate;
 
     struct ShardCandidate {
