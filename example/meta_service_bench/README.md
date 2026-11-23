@@ -45,6 +45,73 @@ The benchmark does not use a real local_service. Each client child process simul
 | IsExistRequest → IsExistResponse | BatchIsExistRequest → BatchIsExistResponse |
 | RemoveRequest → Response | BatchRemoveRequest → BatchRemoveResponse |
 
+## Prefix-tree Workload Simulator
+
+The benchmark also provides a synthetic prefix-cache workload for testing MetaService metadata without SGLang or NPU
+hardware. It generates deterministic logical page paths shared by multiple simulated requests, for example:
+
+```text
+request 1: A → B → C → D
+request 2: A → B → C → E
+request 3: A → B → F
+```
+
+Each logical page expands into physical component keys. With the default two components this creates independent K/V
+paths such as:
+
+```text
+A_k → B_k → C_k → D_k
+A_v → B_v → C_v → D_v
+```
+
+For every synthetic request the benchmark issues `BatchGet` for all physical keys, determines the longest complete
+prefix (all components of every page must be readable), and writes only the missing suffix through
+`BatchAllocWithParentsRequest` followed by `BatchUpdateRequest(WRITE_OK)`. The write request is component-major, for
+example `keys=[C_k,D_k,C_v,D_v]`, `parents=[B_k,B_v]`.
+
+This exercises the parent-aware allocation API from MemCache PR #8. The current API transports parent paths; prefix
+tree persistence and leaf-only eviction must be implemented in MetaService separately before this workload can verify
+their correctness.
+
+### Prefix workload options
+
+| Option | Description |
+|---|---|
+| `--workload prefix_tree` | Enable the prefix-tree simulator. Default is the existing random put/get workload. |
+| `--prefix-roots N` | Number of independent prefix roots. |
+| `--prefix-depth N` | Maximum supported request depth. |
+| `--prefix-fanout N` | Number of possible branches at each non-shared page. |
+| `--shared-prefix-percent N` | Percentage of requests using the hot shared prefix. |
+| `--shared-prefix-pages N` | Number of pages in that hot prefix. |
+| `--request-pages N` | Logical page count per generated request. |
+| `--components N` | Physical components per logical page; `2` means K and V. |
+| `--seed N` | Deterministic request generator seed. |
+| `--validate-prefix-workload` | Run the pure generator self-check and exit. |
+
+### Examples
+
+```bash
+# Verify the deterministic generator without starting MetaService.
+./build/example/meta_service_bench/bench_meta_service --validate-prefix-workload
+
+# Small deterministic parent-aware run: one rank and one worker.
+./build/example/meta_service_bench/bench_meta_service \
+    --workload prefix_tree -p 1 -t 1 -n 100 \
+    --prefix-roots 1 --prefix-depth 4 --request-pages 4 \
+    --prefix-fanout 8 --shared-prefix-percent 100 --shared-prefix-pages 3 \
+    --components 2 -c 64
+
+# Concurrent shared-prefix pressure run.
+./build/example/meta_service_bench/bench_meta_service \
+    --workload prefix_tree -p 4 -t 4 -n 10000 \
+    --prefix-depth 8 --prefix-fanout 16 --shared-prefix-percent 80 \
+    --shared-prefix-pages 3 --request-pages 6 --components 2 -c 128
+```
+
+The report includes request/page hit counts, complete-request hits, pages/components written, partial physical pages,
+and lookup/write failures. A partial page means only a subset of its physical components was readable; it is never
+counted as a prefix-cache hit.
+
 ## Prerequisites
 
 ### 1. Build and Install memcache

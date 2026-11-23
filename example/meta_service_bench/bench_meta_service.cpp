@@ -53,6 +53,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <netinet/in.h>
 #include <random>
@@ -63,6 +64,7 @@
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 #include "mmc_blob_allocator.h"
@@ -76,6 +78,7 @@
 #include "mmc_ptracer.h"
 #include "mmc_ref.h"
 #include "mmc_types.h"
+#include "prefix_workload.h"
 
 using namespace std;
 using namespace ock::mmc;
@@ -126,12 +129,22 @@ constexpr const char *kDefaultPerfDataFile = "perf.data";
 constexpr int kDefaultMetricsIntervalMs = 1000;
 constexpr int kMetricsConnectTimeoutMs = 500;
 constexpr int kMetricsReceiveBufferSize = 16 * 1024;
+constexpr uint32_t kDefaultPrefixRootCount = 4;
+constexpr uint32_t kDefaultPrefixDepth = 8;
+constexpr uint32_t kDefaultPrefixFanout = 8;
+constexpr uint32_t kDefaultSharedPrefixPercent = 80;
+constexpr uint32_t kDefaultSharedPrefixPages = 3;
+constexpr uint32_t kDefaultPrefixRequestPages = 6;
+constexpr uint32_t kDefaultPrefixComponentCount = 2;
+constexpr uint64_t kDefaultPrefixSeed = 42;
 
 constexpr uint64_t kBytesPerMB = 1024 * 1024;
 
 int gTermFd = STDERR_FILENO;
 
-enum OpType : int { kOpPut = 0, kOpGet, kOpTypeCount };
+enum OpType : int { kOpPut = 0, kOpGet, kOpPrefixRequest, kOpTypeCount };
+
+enum class WorkloadMode : uint8_t { RANDOM, PREFIX_TREE };
 
 inline const char *OpTypeName(OpType t)
 {
@@ -140,9 +153,16 @@ inline const char *OpTypeName(OpType t)
             return "Put";
         case kOpGet:
             return "Get";
+        case kOpPrefixRequest:
+            return "Prefix";
         default:
             return "Unknown";
     }
+}
+
+const char *WorkloadModeName(WorkloadMode mode)
+{
+    return mode == WorkloadMode::PREFIX_TREE ? "prefix_tree" : "random";
 }
 
 struct BenchConfig {
@@ -160,7 +180,31 @@ struct BenchConfig {
     bool perfEnable = false;
     int perfFreq = kDefaultPerfFreq;
     int metricsIntervalMs = kDefaultMetricsIntervalMs;
+    WorkloadMode workloadMode = WorkloadMode::RANDOM;
+    uint32_t prefixRootCount = kDefaultPrefixRootCount;
+    uint32_t prefixDepth = kDefaultPrefixDepth;
+    uint32_t prefixFanout = kDefaultPrefixFanout;
+    uint32_t sharedPrefixPercent = kDefaultSharedPrefixPercent;
+    uint32_t sharedPrefixPages = kDefaultSharedPrefixPages;
+    uint32_t prefixRequestPages = kDefaultPrefixRequestPages;
+    uint32_t prefixComponentCount = kDefaultPrefixComponentCount;
+    uint64_t prefixSeed = kDefaultPrefixSeed;
+    bool validatePrefixWorkload = false;
 };
+
+bench::PrefixWorkloadConfig ToPrefixWorkloadConfig(const BenchConfig &cfg)
+{
+    bench::PrefixWorkloadConfig config;
+    config.rootCount = cfg.prefixRootCount;
+    config.maxDepth = cfg.prefixDepth;
+    config.fanout = cfg.prefixFanout;
+    config.sharedPrefixPercent = cfg.sharedPrefixPercent;
+    config.sharedPrefixPages = cfg.sharedPrefixPages;
+    config.requestPages = cfg.prefixRequestPages;
+    config.componentCount = cfg.prefixComponentCount;
+    config.seed = cfg.prefixSeed;
+    return config;
+}
 
 void TermLog(const char *fmt, ...)
 {
@@ -283,6 +327,17 @@ struct ThreadStats {
     uint64_t failureCount[kOpTypeCount] = {0};
     LatencySamples latency[kOpTypeCount];
     LatencyHistogram histogram[kOpTypeCount];
+    struct PrefixStats {
+        uint64_t requestCount{0};
+        uint64_t fullHitCount{0};
+        uint64_t pageHitCount{0};
+        uint64_t pageMissCount{0};
+        uint64_t pageWriteCount{0};
+        uint64_t componentWriteCount{0};
+        uint64_t partialPageCount{0};
+        uint64_t lookupFailureCount{0};
+        uint64_t writeFailureCount{0};
+    } prefix;
 };
 
 struct PerOpResult {
@@ -302,6 +357,7 @@ struct ProcessResult {
     int pid;
     int valid;
     PerOpResult ops[kOpTypeCount];
+    ThreadStats::PrefixStats prefix;
     double durationSec;
     int padding[8];
 };
@@ -558,6 +614,34 @@ void PrintAggReport(const std::vector<ProcessResult> &results, const BenchConfig
     std::cout << "Max duration (wall): " << std::fixed << std::setprecision(2) << maxDuration << " sec\n";
     std::cout << "Throughput:         " << std::fixed << std::setprecision(2) << throughput << " ops/sec\n\n";
 
+    if (cfg.workloadMode == WorkloadMode::PREFIX_TREE) {
+        ThreadStats::PrefixStats prefix{};
+        for (const auto &result : results) {
+            prefix.requestCount += result.prefix.requestCount;
+            prefix.fullHitCount += result.prefix.fullHitCount;
+            prefix.pageHitCount += result.prefix.pageHitCount;
+            prefix.pageMissCount += result.prefix.pageMissCount;
+            prefix.pageWriteCount += result.prefix.pageWriteCount;
+            prefix.componentWriteCount += result.prefix.componentWriteCount;
+            prefix.partialPageCount += result.prefix.partialPageCount;
+            prefix.lookupFailureCount += result.prefix.lookupFailureCount;
+            prefix.writeFailureCount += result.prefix.writeFailureCount;
+        }
+        const uint64_t totalPages = prefix.pageHitCount + prefix.pageMissCount;
+        const double pageHitRate = totalPages == 0 ? 0.0
+                                                   : static_cast<double>(prefix.pageHitCount) /
+                                                         static_cast<double>(totalPages);
+        std::cout << "Prefix workload: requests=" << prefix.requestCount << ", full_hits=" << prefix.fullHitCount
+                  << ", page_hits=" << prefix.pageHitCount << ", page_misses=" << prefix.pageMissCount
+                  << ", page_hit_rate=" << std::fixed << std::setprecision(2) << pageHitRate * kPercentileDivisor
+                  << "%\n"
+                  << "                 pages_written=" << prefix.pageWriteCount
+                  << ", components_written=" << prefix.componentWriteCount
+                  << ", partial_pages=" << prefix.partialPageCount
+                  << ", lookup_failures=" << prefix.lookupFailureCount
+                  << ", write_failures=" << prefix.writeFailureCount << "\n\n";
+    }
+
     std::cout << "Per-process summary:\n";
     std::cout << "  " << std::left << std::setw(6) << "Rank" << " | " << std::right << std::setw(8) << "PID" << " | "
               << std::right << std::setw(8) << "Ops" << " | " << std::right << std::setw(8) << "Succ" << " | "
@@ -632,7 +716,7 @@ Result DoBatchPut(MetaNetClient &client, const std::vector<std::string> &keys, u
     for (size_t i = 0; i < keys.size(); ++i) {
         options.push_back(AllocOptions(blobSize, 1, MEDIA_HBM, {rank}, 0));
     }
-    BatchAllocRequest allocReq(keys, options, 0, operateId);
+    BatchAllocRequest allocReq(keys, options, 0, operateId, rank);
     BatchAllocResponse allocResp;
     if (client.SyncCall(allocReq, allocResp, kRpcTimeoutMs) != MMC_OK)
         return MMC_ERROR;
@@ -670,7 +754,148 @@ Result DoBatchGet(MetaNetClient &client, const std::vector<std::string> &keys, u
     return client.SyncCall(req, resp, kRpcTimeoutMs);
 }
 
-void Worker(MetaNetClient &client, const BenchConfig &cfg, ThreadStats &stats, int tid, uint32_t rank)
+Result DoBatchGetResults(MetaNetClient &client, const std::vector<std::string> &keys, uint32_t rank,
+                         std::vector<Result> &results)
+{
+    BatchGetRequest req(keys, rank, GenerateOperateId(rank));
+    BatchAllocResponse resp;
+    const Result ret = client.SyncCall(req, resp, kRpcTimeoutMs);
+    if (ret != MMC_OK) {
+        return ret;
+    }
+    if (resp.results_.size() != keys.size()) {
+        return MMC_ERROR;
+    }
+    results = std::move(resp.results_);
+    return MMC_OK;
+}
+
+Result DoBatchPutWithParents(MetaNetClient &client, const std::vector<std::string> &keys,
+                             const std::vector<std::string> &parents, uint32_t rank, uint64_t blobSize)
+{
+    if (keys.empty() || parents.empty() || keys.size() % parents.size() != 0) {
+        return MMC_INVALID_PARAM;
+    }
+
+    const uint64_t operateId = GenerateOperateId(rank);
+    std::vector<AllocOptions> options;
+    options.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        options.emplace_back(blobSize, 1, MEDIA_HBM, std::vector<uint32_t>{rank}, 0);
+    }
+    BatchAllocWithParentsRequest allocReq(keys, parents, options, 0, operateId, rank);
+    BatchAllocResponse allocResp;
+    const Result allocRet = client.SyncCall(allocReq, allocResp, kRpcTimeoutMs);
+    if (allocRet != MMC_OK || allocResp.results_.size() != keys.size() || allocResp.blobs_.size() != keys.size()) {
+        return allocRet == MMC_OK ? MMC_ERROR : allocRet;
+    }
+
+    BatchUpdateRequest updateReq{};
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (allocResp.results_[i] != MMC_OK) {
+            if (allocResp.results_[i] != MMC_DUPLICATED_OBJECT) {
+                return allocResp.results_[i];
+            }
+            continue;
+        }
+        for (const auto &blob : allocResp.blobs_[i]) {
+            updateReq.keys_.push_back(keys[i]);
+            updateReq.ranks_.push_back(blob.rank_);
+            updateReq.mediaTypes_.push_back(blob.mediaType_);
+            updateReq.actionResults_.push_back(MMC_WRITE_OK);
+            updateReq.operateIds_.push_back(operateId);
+        }
+    }
+    if (updateReq.keys_.empty()) {
+        return MMC_OK;
+    }
+    BatchUpdateResponse updateResp;
+    return client.SyncCall(updateReq, updateResp, kRpcTimeoutMs);
+}
+
+struct PrefixRequestOutcome {
+    Result ret{MMC_ERROR};
+    uint64_t pageHits{0};
+    uint64_t pageMisses{0};
+    uint64_t pageWrites{0};
+    uint64_t componentWrites{0};
+    uint64_t partialPages{0};
+};
+
+PrefixRequestOutcome DoPrefixRequest(MetaNetClient &client, const bench::PrefixWorkload &workload,
+                                     const bench::PrefixRequest &request, uint32_t rank, uint64_t blobSize)
+{
+    PrefixRequestOutcome outcome;
+    if (request.pages.empty()) {
+        outcome.ret = MMC_INVALID_PARAM;
+        return outcome;
+    }
+    const std::vector<std::string> keys = workload.MakePageMajorPhysicalKeys(request);
+    if (keys.empty() || keys.size() % request.pages.size() != 0) {
+        outcome.ret = MMC_INVALID_PARAM;
+        return outcome;
+    }
+    std::vector<Result> getResults;
+    outcome.ret = DoBatchGetResults(client, keys, rank, getResults);
+    if (outcome.ret != MMC_OK) {
+        return outcome;
+    }
+
+    const size_t componentCount = keys.empty() ? 0 : keys.size() / request.pages.size();
+    size_t cachedPageCount = 0;
+    for (size_t pageIndex = 0; pageIndex < request.pages.size(); ++pageIndex) {
+        size_t readableComponents = 0;
+        for (size_t componentIndex = 0; componentIndex < componentCount; ++componentIndex) {
+            if (getResults[pageIndex * componentCount + componentIndex] == MMC_OK) {
+                ++readableComponents;
+            }
+        }
+        if (readableComponents == componentCount) {
+            ++cachedPageCount;
+            ++outcome.pageHits;
+            continue;
+        }
+        if (readableComponents != 0) {
+            ++outcome.partialPages;
+        }
+        break;
+    }
+    outcome.pageMisses = request.pages.size() - cachedPageCount;
+    if (cachedPageCount == request.pages.size()) {
+        outcome.ret = MMC_OK;
+        return outcome;
+    }
+
+    const bench::PhysicalWritePlan writePlan = workload.MakeWritePlan(request, cachedPageCount);
+    outcome.ret = DoBatchPutWithParents(client, writePlan.keys, writePlan.parents, rank, blobSize);
+    if (outcome.ret == MMC_OK) {
+        outcome.pageWrites = request.pages.size() - cachedPageCount;
+        outcome.componentWrites = writePlan.keys.size();
+    }
+    return outcome;
+}
+
+void AddPrefixOutcome(ThreadStats::PrefixStats &stats, const PrefixRequestOutcome &outcome)
+{
+    ++stats.requestCount;
+    stats.pageHitCount += outcome.pageHits;
+    stats.pageMissCount += outcome.pageMisses;
+    stats.pageWriteCount += outcome.pageWrites;
+    stats.componentWriteCount += outcome.componentWrites;
+    stats.partialPageCount += outcome.partialPages;
+    if (outcome.ret != MMC_OK) {
+        if (outcome.pageHits == 0 && outcome.pageMisses == 0) {
+            ++stats.lookupFailureCount;
+        } else {
+            ++stats.writeFailureCount;
+        }
+    } else if (outcome.pageMisses == 0) {
+        ++stats.fullHitCount;
+    }
+}
+
+void Worker(MetaNetClient &client, const BenchConfig &cfg, ThreadStats &stats, int tid, uint32_t rank,
+            const bench::PrefixWorkload *prefixWorkload)
 {
     std::mt19937 rng(
         static_cast<unsigned int>(std::hash<std::thread::id>()(std::this_thread::get_id()) ^ static_cast<size_t>(tid)));
@@ -681,6 +906,26 @@ void Worker(MetaNetClient &client, const BenchConfig &cfg, ThreadStats &stats, i
     uint64_t putCounter = 0;
 
     for (int i = 0; i < cfg.opsPerThread; ++i) {
+        if (prefixWorkload != nullptr) {
+            const uint64_t requestId =
+                (static_cast<uint64_t>(rank) * static_cast<uint64_t>(cfg.threadCount) + static_cast<uint64_t>(tid)) *
+                    static_cast<uint64_t>(cfg.opsPerThread) +
+                static_cast<uint64_t>(i);
+            const bench::PrefixRequest request = prefixWorkload->MakeRequest(requestId);
+            const double startUs = NowUs();
+            const PrefixRequestOutcome outcome = DoPrefixRequest(client, *prefixWorkload, request, rank, cfg.blobSize);
+            const double endUs = NowUs();
+            if (outcome.ret == MMC_OK) {
+                ++stats.successCount[kOpPrefixRequest];
+            } else {
+                ++stats.failureCount[kOpPrefixRequest];
+            }
+            stats.latency[kOpPrefixRequest].Record(endUs - startUs);
+            stats.histogram[kOpPrefixRequest].Record(endUs - startUs);
+            AddPrefixOutcome(stats.prefix, outcome);
+            continue;
+        }
+
         bool isPut = rd(rng) <= cfg.putPercent;
         int batchSize = bd(rng);
         OpType op = isPut ? kOpPut : kOpGet;
@@ -864,11 +1109,24 @@ int RunClient(const BenchConfig &cfg, int clientIndex, ProcessResult *resultSlot
     TermLog("[client %d] Connected, rank=%u, capacity=%llu MB\n", clientIndex, rank,
             static_cast<unsigned long long>(cfg.capacityMB));
 
-    int warmupPerClient = cfg.warmupKeyCount / cfg.processCount;
-    int warmupStart = clientIndex * warmupPerClient;
-    for (int i = 0; i < warmupPerClient; ++i) {
-        std::string key = MakeKey(warmupStart + i);
-        DoPut(*client.Get(), key, rank, cfg.blobSize);
+    if (cfg.workloadMode == WorkloadMode::RANDOM) {
+        int warmupPerClient = cfg.warmupKeyCount / cfg.processCount;
+        int warmupStart = clientIndex * warmupPerClient;
+        for (int i = 0; i < warmupPerClient; ++i) {
+            std::string key = MakeKey(warmupStart + i);
+            DoPut(*client.Get(), key, rank, cfg.blobSize);
+        }
+    }
+
+    std::unique_ptr<bench::PrefixWorkload> prefixWorkload;
+    if (cfg.workloadMode == WorkloadMode::PREFIX_TREE) {
+        prefixWorkload = std::make_unique<bench::PrefixWorkload>(ToPrefixWorkloadConfig(cfg));
+        std::string error;
+        if (!prefixWorkload->IsValid(error)) {
+            TermLog("[client %d] Invalid prefix workload: %s\n", clientIndex, error.c_str());
+            client->Stop();
+            return 1;
+        }
     }
 
     std::vector<ThreadStats> threadStats(static_cast<size_t>(cfg.threadCount));
@@ -878,7 +1136,7 @@ int RunClient(const BenchConfig &cfg, int clientIndex, ProcessResult *resultSlot
     double startUs = NowUs();
     for (int t = 0; t < cfg.threadCount; ++t) {
         workers.emplace_back(Worker, std::ref(*client.Get()), std::ref(cfg),
-                             std::ref(threadStats[static_cast<size_t>(t)]), t, rank);
+                             std::ref(threadStats[static_cast<size_t>(t)]), t, rank, prefixWorkload.get());
     }
     for (auto &w : workers)
         w.join();
@@ -893,9 +1151,19 @@ int RunClient(const BenchConfig &cfg, int clientIndex, ProcessResult *resultSlot
             merged.latency[i].MergeFrom(ts.latency[i]);
             merged.histogram[i].MergeFrom(ts.histogram[i]);
         }
+        merged.prefix.requestCount += ts.prefix.requestCount;
+        merged.prefix.fullHitCount += ts.prefix.fullHitCount;
+        merged.prefix.pageHitCount += ts.prefix.pageHitCount;
+        merged.prefix.pageMissCount += ts.prefix.pageMissCount;
+        merged.prefix.pageWriteCount += ts.prefix.pageWriteCount;
+        merged.prefix.componentWriteCount += ts.prefix.componentWriteCount;
+        merged.prefix.partialPageCount += ts.prefix.partialPageCount;
+        merged.prefix.lookupFailureCount += ts.prefix.lookupFailureCount;
+        merged.prefix.writeFailureCount += ts.prefix.writeFailureCount;
     }
 
     WriteResult(*resultSlot, merged, durationSec, static_cast<int>(rank), getpid());
+    resultSlot->prefix = merged.prefix;
 
     uint64_t totalSucc = 0, totalFail = 0;
     for (int i = 0; i < kOpTypeCount; ++i) {
@@ -938,11 +1206,33 @@ bool ParseArgs(int argc, char *argv[], BenchConfig &cfg)
                 << "  --perf-freq <hz>   perf record sample frequency                (default: " << kDefaultPerfFreq
                 << ")\n"
                 << "  --metrics-interval-ms <ms>  Sample /metrics every ms; 0 disables (default: "
-                << kDefaultMetricsIntervalMs << ")\n";
+                << kDefaultMetricsIntervalMs << ")\n"
+                << "  --workload <random|prefix_tree>       Workload mode (default: random)\n"
+                << "  --prefix-roots <count>                Prefix-tree root count (default: "
+                << kDefaultPrefixRootCount << ")\n"
+                << "  --prefix-depth <count>                Maximum prefix depth (default: "
+                << kDefaultPrefixDepth << ")\n"
+                << "  --prefix-fanout <count>               Maximum children per page (default: "
+                << kDefaultPrefixFanout << ")\n"
+                << "  --shared-prefix-percent <0-100>       Requests using hot shared prefix (default: "
+                << kDefaultSharedPrefixPercent << ")\n"
+                << "  --shared-prefix-pages <count>         Hot shared prefix length (default: "
+                << kDefaultSharedPrefixPages << ")\n"
+                << "  --request-pages <count>               Logical pages per request (default: "
+                << kDefaultPrefixRequestPages << ")\n"
+                << "  --components <count>                  Physical components per page (default: "
+                << kDefaultPrefixComponentCount << ")\n"
+                << "  --seed <value>                        Prefix workload seed (default: "
+                << kDefaultPrefixSeed << ")\n"
+                << "  --validate-prefix-workload             Run prefix generator self-check and exit\n";
             return false;
         }
         if (a == "--perf") {
             cfg.perfEnable = true;
+            continue;
+        }
+        if (a == "--validate-prefix-workload") {
+            cfg.validatePrefixWorkload = true;
             continue;
         }
         if (i + 1 >= argc) {
@@ -981,6 +1271,31 @@ bool ParseArgs(int argc, char *argv[], BenchConfig &cfg)
             cfg.perfFreq = std::max(1, std::atoi(v.c_str()));
         else if (a == "--metrics-interval-ms")
             cfg.metricsIntervalMs = std::max(0, std::atoi(v.c_str()));
+        else if (a == "--workload") {
+            if (v == "random") {
+                cfg.workloadMode = WorkloadMode::RANDOM;
+            } else if (v == "prefix_tree") {
+                cfg.workloadMode = WorkloadMode::PREFIX_TREE;
+            } else {
+                std::cerr << "Invalid workload: " << v << "\n";
+                return false;
+            }
+        } else if (a == "--prefix-roots")
+            cfg.prefixRootCount = static_cast<uint32_t>(std::max(1, std::atoi(v.c_str())));
+        else if (a == "--prefix-depth")
+            cfg.prefixDepth = static_cast<uint32_t>(std::max(1, std::atoi(v.c_str())));
+        else if (a == "--prefix-fanout")
+            cfg.prefixFanout = static_cast<uint32_t>(std::max(1, std::atoi(v.c_str())));
+        else if (a == "--shared-prefix-percent")
+            cfg.sharedPrefixPercent = static_cast<uint32_t>(std::max(0, std::min(100, std::atoi(v.c_str()))));
+        else if (a == "--shared-prefix-pages")
+            cfg.sharedPrefixPages = static_cast<uint32_t>(std::max(0, std::atoi(v.c_str())));
+        else if (a == "--request-pages")
+            cfg.prefixRequestPages = static_cast<uint32_t>(std::max(1, std::atoi(v.c_str())));
+        else if (a == "--components")
+            cfg.prefixComponentCount = static_cast<uint32_t>(std::max(1, std::atoi(v.c_str())));
+        else if (a == "--seed")
+            cfg.prefixSeed = static_cast<uint64_t>(std::strtoull(v.c_str(), nullptr, 10));
         else {
             std::cerr << "Unknown: " << a << "\n";
             return false;
@@ -995,6 +1310,24 @@ int main(int argc, char *argv[])
     BenchConfig cfg;
     if (!ParseArgs(argc, argv, cfg))
         return 1;
+
+    if (cfg.validatePrefixWorkload) {
+        std::string error;
+        if (!bench::ValidatePrefixWorkload(error)) {
+            std::cerr << "Prefix workload self-check failed: " << error << std::endl;
+            return 1;
+        }
+        std::cout << "Prefix workload self-check passed." << std::endl;
+        return 0;
+    }
+    if (cfg.workloadMode == WorkloadMode::PREFIX_TREE) {
+        bench::PrefixWorkload workload(ToPrefixWorkloadConfig(cfg));
+        std::string error;
+        if (!workload.IsValid(error)) {
+            std::cerr << "Invalid prefix workload: " << error << std::endl;
+            return 1;
+        }
+    }
 
     gTermFd = dup(STDERR_FILENO);
     if (gTermFd < 0)
@@ -1013,6 +1346,7 @@ int main(int argc, char *argv[])
               << "  Ops/thread:   " << cfg.opsPerThread << "\n"
               << "  Total ops:    " << (cfg.processCount * cfg.threadCount * cfg.opsPerThread) << "\n"
               << "  Key space:    " << cfg.keySpaceSize << "\n"
+              << "  Workload:     " << WorkloadModeName(cfg.workloadMode) << "\n"
               << "  Blob size:    " << cfg.blobSize << " bytes\n"
               << "  Warmup keys:  " << cfg.warmupKeyCount << "\n"
               << "  Put percent:  " << cfg.putPercent << "%\n"
@@ -1025,6 +1359,13 @@ int main(int argc, char *argv[])
               << (cfg.metricsIntervalMs > 0 ? std::to_string(cfg.metricsIntervalMs) + " ms" : std::string("off"))
               << "\n"
               << std::endl;
+
+    if (cfg.workloadMode == WorkloadMode::PREFIX_TREE) {
+        std::cout << "Prefix config: roots=" << cfg.prefixRootCount << ", depth=" << cfg.prefixDepth
+                  << ", fanout=" << cfg.prefixFanout << ", shared=" << cfg.sharedPrefixPercent << "%/"
+                  << cfg.sharedPrefixPages << " pages, request_pages=" << cfg.prefixRequestPages
+                  << ", components=" << cfg.prefixComponentCount << ", seed=" << cfg.prefixSeed << "\n\n";
+    }
 
     std::string metaUrl = "tcp://127.0.0.1:" + std::to_string(kMetaServicePort);
     std::string bmUrl = "tcp://127.0.0.1:" + std::to_string(kConfigStorePort);
