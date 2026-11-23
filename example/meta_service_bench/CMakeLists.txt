@@ -43,7 +43,7 @@ if (("${BUILD_CPP_EXAMPLE}" STREQUAL "") OR ("${BUILD_CPP_EXAMPLE}" STREQUAL "OF
             "/usr/local/memcache_hybrid/*.so"
             "/usr/local/memcache_hybrid/*/*.so"
     )
-    add_executable(bench_meta_service bench_meta_service.cpp)
+    add_executable(bench_meta_service bench_meta_service.cpp prefix_workload.cpp)
     foreach (SO ${ALL_SO})
         get_filename_component(FILENAME ${SO} NAME)
         if ("${FILENAME}" MATCHES "^libmf_memcache")
@@ -59,7 +59,7 @@ if (("${BUILD_CPP_EXAMPLE}" STREQUAL "") OR ("${BUILD_CPP_EXAMPLE}" STREQUAL "OF
 else ()
     message(STATUS "BUILD_CPP_EXAMPLE is ON (bench_meta_service in-tree mode).")
 
-    add_executable(bench_meta_service bench_meta_service.cpp)
+    add_executable(bench_meta_service bench_meta_service.cpp prefix_workload.cpp)
 
     target_include_directories(bench_meta_service PRIVATE
             ${PROJECT_MMC_SRC_BASE}/include/
