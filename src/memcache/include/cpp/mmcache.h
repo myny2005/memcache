@@ -407,13 +407,15 @@ public:
 
     /**
      * @brief Put object data directly from pre-allocated buffers for multiple keys with parent keys
-     * @param keys Vector of keys of the objects to put, grouped into equal-length paths
-     * @param parents Vector of parent keys, one per consecutive path in keys
+     * @param keys Vector of unique keys of the objects to put, grouped into equal-length paths
+     * @param parents Non-empty vector of parent keys, one per consecutive path in keys; an empty string denotes a root
+     *                path
      * @param buffers Vector of pointers to the pre-allocated buffers
      * @param sizes Vector of sizes of the buffers
      * @param direct Data copy direction, as in BatchPutFrom
      * @param replicateConfig Preferred rank for allocation
-     * @note Parent keys are forwarded to MetaService only; parent-child relationships are not applied yet.
+     * @note keys.size() must be divisible by parents.size(). A non-empty parent must not also appear in keys.
+     *       Parent-child metadata is not applied yet.
      * @return Vector of integers, where each element is 0 on success, or a negative value on error
      */
     virtual std::vector<int> BatchPutFromWithParents(const std::vector<std::string> &keys,

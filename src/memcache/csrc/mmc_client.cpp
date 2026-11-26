@@ -12,6 +12,7 @@
 #include "mmc_client.h"
 #include "mmc_common_includes.h"
 #include "mmc_client_default.h"
+#include "mmc_parent_path.h"
 
 using namespace ock::mmc;
 
@@ -584,7 +585,8 @@ MMC_API int32_t mmcc_batch_put_with_parents(const char **keys, const char **pare
     MMC_VALIDATE_RETURN(bufs != nullptr, "invalid param, bufs is null", MMC_INVALID_PARAM);
     MMC_VALIDATE_RETURN(results != nullptr, "invalid param, results is null", MMC_INVALID_PARAM);
     MMC_VALIDATE_RETURN(MmcClientDefault::GetInstance() != nullptr, "client is not initialize", MMC_CLIENT_NOT_INIT);
-    MMC_VALIDATE_RETURN(parents != nullptr || parentsCount == 0, "invalid param, parents is null", MMC_INVALID_PARAM);
+    MMC_VALIDATE_RETURN(parents != nullptr, "invalid param, parents is null", MMC_INVALID_PARAM);
+    MMC_VALIDATE_RETURN(parentsCount != 0, "invalid param, parents_count: " << parentsCount, MMC_INVALID_PARAM);
 
     std::vector<std::string> keysVector;
     std::vector<std::string> parentsVector;
@@ -617,6 +619,10 @@ MMC_API int32_t mmcc_batch_put_with_parents(const char **keys, const char **pare
                             MMC_INVALID_PARAM);
         parentsVector.emplace_back(parents[i]);
     }
+    ParentPathLayout parentPathLayout;
+    MMC_VALIDATE_RETURN(ValidateParentPaths(keysVector, parentsVector, parentPathLayout) == MMC_OK,
+                        "invalid parent paths, keys_count: " << keysCount << ", parents_count: " << parentsCount,
+                        MMC_INVALID_PARAM);
 
     MMC_RETURN_ERROR(MmcClientDefault::GetInstance()->BatchPutWithParents(keysVector, parentsVector, bufsVector,
                                                                           options, flags, batchResult),

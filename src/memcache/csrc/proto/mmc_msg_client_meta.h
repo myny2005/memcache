@@ -294,6 +294,8 @@ struct BatchAllocRequest : MsgBase {
 };
 
 struct BatchAllocWithParentsRequest : MsgBase {
+    // Consecutive equal-length physical paths. For keys=[B_k,C_k,B_v,C_v] and parents=[A_k,A_v], the paths are
+    // A_k -> B_k -> C_k and A_v -> B_v -> C_v. An empty parent denotes a root path.
     std::vector<std::string> keys;
     std::vector<std::string> parents;
     std::vector<AllocOptions> options;

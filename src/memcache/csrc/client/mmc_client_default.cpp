@@ -11,6 +11,7 @@
 */
 
 #include "mmc_client_default.h"
+#include "mmc_parent_path.h"
 
 #include "mmc_meta_discovery.h"
 #include "smem_bm_api.h"
@@ -514,6 +515,14 @@ Result MmcClientDefault::BatchPutWithParents(const std::vector<std::string> &key
         return MMC_INVALID_PARAM;
     }
 
+    ParentPathLayout parentPathLayout;
+    const Result parentPathRet = ValidateParentPaths(keys, parents, parentPathLayout);
+    if (parentPathRet != MMC_OK) {
+        MMC_LOG_ERROR("client " << name_ << " batch put with parents has invalid paths: keys=" << keys.size()
+                                 << ", parents=" << parents.size());
+        return parentPathRet;
+    }
+
     // DoBatchPut assigns batchResult centrally; an early return on alloc RPC failure preserves the caller's values.
     auto ret = DoBatchPutWithParents(keys, parents, bufArrs, options, flags, batchResult);
 
@@ -528,28 +537,39 @@ Result MmcClientDefault::BatchPutWithParents(const std::vector<std::string> &key
             }
             break;
         }
-        std::vector<std::string> retryKeys;
-        std::vector<MmcBufferArray> retryBufArrs;
-        retryKeys.reserve(retryIndices.size());
-        retryBufArrs.reserve(retryIndices.size());
-        for (size_t index : retryIndices) {
-            retryKeys.push_back(keys[index]);
-            retryBufArrs.push_back(bufArrs[index]);
+        std::vector<ParentPathRetry> retries;
+        const Result buildRetryRet =
+            BuildParentPathRetries(keys, parents, parentPathLayout, retryIndices, retries);
+        if (buildRetryRet != MMC_OK) {
+            MMC_LOG_ERROR("client " << name_ << " cannot build parent-aware retry paths, ret: " << buildRetryRet);
+            ret = buildRetryRet;
+            break;
         }
-        MMC_LOG_WARN("client " << name_ << " batch put " << retryKeys.size() << " keys copy failed, retry round "
-                               << retryRound << "/" << MAX_PUT_RETRY_TIMES);
+
+        MMC_LOG_WARN("client " << name_ << " batch put " << retryIndices.size() << " keys copy failed in "
+                                << retries.size() << " parent-aware paths, retry round "
+                                << retryRound << "/" << MAX_PUT_RETRY_TIMES);
         mmc_put_options retryOptions = options;
         std::fill(std::begin(retryOptions.preferredLocalServiceIDs), std::end(retryOptions.preferredLocalServiceIDs),
                   -1);
-        // Keep the initial -2017: an early return on alloc RPC failure during retry must preserve the original failure.
-        std::vector<int> retryResult(retryKeys.size(), SMEM_BM_GVA_NOT_FOUND);
-        const Result retryRet =
-            DoBatchPutWithParents(retryKeys, parents, retryBufArrs, retryOptions, flags, retryResult);
-        for (size_t j = 0; j < retryIndices.size(); ++j) {
-            batchResult[retryIndices[j]] = retryResult[j];
-        }
-        if (retryRet != MMC_OK && ret == MMC_OK) {
-            ret = retryRet;
+        for (const auto &retry : retries) {
+            std::vector<MmcBufferArray> retryBufArrs;
+            retryBufArrs.reserve(retry.sourceIndices.size());
+            for (const size_t sourceIndex : retry.sourceIndices) {
+                retryBufArrs.push_back(bufArrs[sourceIndex]);
+            }
+
+            // Keep the initial -2017: an early return on alloc RPC failure during retry must preserve the original
+            // failure.
+            std::vector<int> retryResult(retry.keys.size(), SMEM_BM_GVA_NOT_FOUND);
+            const Result retryRet = DoBatchPutWithParents(retry.keys, retry.parents, retryBufArrs, retryOptions, flags,
+                                                           retryResult);
+            for (size_t resultIndex = 0; resultIndex < retry.sourceIndices.size(); ++resultIndex) {
+                batchResult[retry.sourceIndices[resultIndex]] = retryResult[resultIndex];
+            }
+            if (retryRet != MMC_OK && ret == MMC_OK) {
+                ret = retryRet;
+            }
         }
     }
 

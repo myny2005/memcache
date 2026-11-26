@@ -252,15 +252,16 @@ int32_t mmcc_batch_put(const char **keys, uint32_t keys_count, const mmc_buffer 
 
 /**
  * @brief Put multiple data objects with parent keys into Distributed Memory Cache
- * @param keys           [in] Array of keys, grouped into equal-length paths
- * @param parents        [in] Array of parent keys, one per consecutive path in keys
+ * @param keys           [in] Array of unique keys, grouped into consecutive equal-length paths
+ * @param parents        [in] Non-empty array of parent keys, one per consecutive path in keys; an empty string
+ *                         denotes a root path
  * @param keysCount      [in] Number of keys
  * @param parentsCount   [in] Number of parent keys
  * @param bufs           [in] Array of data buffers to be put
  * @param options        [in] Options for the batch put operation
  * @param flags          [in] Optional flags, reserved
  * @param results        [out] Result for each key
- * @note Parents are forwarded only; write behavior is identical to mmcc_batch_put.
+ * @note keysCount must be divisible by parentsCount. A non-empty parent must not also appear in keys.
  * @return 0 if successful
  */
 int32_t mmcc_batch_put_with_parents(const char **keys, const char **parents, uint32_t keysCount, uint32_t parentsCount,

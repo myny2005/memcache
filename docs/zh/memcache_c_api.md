@@ -598,14 +598,15 @@ int32_t mmcc_batch_put_with_parents(const char **keys, const char **parents, uin
 
 **Function**
 
-Same write behavior as `mmcc_batch_put`, with parent keys forwarded through the client to MetaService.
-Parent-child relationships are not applied or validated yet.
+Same write behavior as `mmcc_batch_put`, with validated parent paths forwarded through the client to MetaService.
+Parent-child relationships are not applied yet.
 
 **parameter**
 
-- `keys`: Flat key array, grouped into consecutive equal-length paths.
-- `parents`: Parent-key array, one parent per path. For `keys=[A,B,C,D,E,F]` and `parents=[X,Y]`, the intended
-  paths are `X -> A -> B -> C` and `Y -> D -> E -> F`. This mapping is not used yet.
+- `keys`: Flat array of unique keys, grouped into consecutive equal-length paths.
+- `parents`: Non-empty parent-key array, one parent per path. An empty string denotes a root path. For
+  `keys=[A,B,C,D,E,F]` and `parents=[X,Y]`, the paths are `X -> A -> B -> C` and `Y -> D -> E -> F`.
+- `keysCount` must be divisible by `parentsCount`. A non-empty parent must not also occur in `keys`.
 - `keysCount`, `parentsCount`: Number of elements in `keys` and `parents`, respectively.
 - `bufs`, `options`, `flags`, `results`: Same meaning as in `mmcc_batch_put`.
 

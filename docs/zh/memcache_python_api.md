@@ -447,15 +447,16 @@ result = store.batch_put_from_with_parents(
 
 **Function**
 
-Write data in batches exactly as `batch_put_from`, with a parent-key list as the second argument.
-Parent keys are forwarded through the client to MetaService, but parent-child relationships are not applied or
-validated yet. Allocation, copying, retries, default arguments, and return values match `batch_put_from`.
+Write data in batches exactly as `batch_put_from`, with a validated parent-key list as the second argument.
+Parent-child metadata is not applied yet. Allocation, copying, default arguments, and return values otherwise match
+`batch_put_from`.
 
 **parameter**
 
-- `keys`: Flat key list, grouped into consecutive equal-length paths.
-- `parents`: Parent-key list, one parent for each path. For `keys=[A,B,C,D,E,F]` and `parents=[X,Y]`, the intended
-  paths are `X -> A -> B -> C` and `Y -> D -> E -> F`. This mapping is not used by the current implementation.
+- `keys`: Flat list of unique keys, grouped into consecutive equal-length paths.
+- `parents`: Non-empty parent-key list, one parent for each path. An empty string denotes a root path. For
+  `keys=[A,B,C,D,E,F]` and `parents=[X,Y]`, the paths are `X -> A -> B -> C` and `Y -> D -> E -> F`.
+- `len(keys)` must be divisible by `len(parents)`. A non-empty parent must not also occur in `keys`.
 - `buffer_ptrs`, `sizes`, `direct`, `replicateConfig`: Same meaning and defaults as in `batch_put_from`.
 
 **return value**

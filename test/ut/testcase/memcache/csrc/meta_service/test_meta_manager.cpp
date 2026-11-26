@@ -201,6 +201,40 @@ TEST_F(TestMmcMetaManager, PendingGetDoesNotDependOnRewarmWorkerAvailability)
     metaMng->Stop();
 }
 
+TEST_F(TestMmcMetaManager, BatchAllocWithParentsRejectsMalformedPaths)
+{
+    constexpr uint64_t defaultTtlMs = 2000U;
+    constexpr uint16_t highWatermark = 70U;
+    constexpr uint16_t lowWatermark = 60U;
+    constexpr uint32_t rank = 0U;
+    constexpr uint8_t replicaCount = 1U;
+    constexpr size_t duplicateKeyCount = 2U;
+
+    auto proxy = MmcMakeRef<MmcMetaMgrProxy>(MetaNetServerPtr{});
+    ASSERT_NE(proxy, nullptr);
+    ASSERT_EQ(proxy->Start(defaultTtlMs, highWatermark, lowWatermark), MMC_OK);
+
+    const std::vector<std::string> keys{"duplicated_k", "duplicated_k"};
+    const std::vector<std::string> parents{"root_k"};
+    const AllocOptions options(SIZE_32K, replicaCount, MEDIA_DRAM, {rank}, ALLOC_RANDOM);
+    const std::vector<AllocOptions> allocOptions{options, options};
+    BatchAllocWithParentsRequest request(keys, parents, allocOptions, 0, GenerateOperateId(rank), rank);
+    BatchAllocResponse response;
+
+    EXPECT_EQ(proxy->BatchAllocWithParents(request, response), MMC_INVALID_PARAM);
+    ASSERT_EQ(response.results_.size(), duplicateKeyCount);
+    EXPECT_EQ(response.results_[0], MMC_INVALID_PARAM);
+    EXPECT_EQ(response.results_[1], MMC_INVALID_PARAM);
+    EXPECT_EQ(response.blobs_.size(), duplicateKeyCount);
+    EXPECT_TRUE(response.blobs_[0].empty());
+    EXPECT_TRUE(response.blobs_[1].empty());
+
+    size_t keyCount = 0;
+    EXPECT_EQ(proxy->GetMetaManager()->GetKeyCount(keyCount), MMC_OK);
+    EXPECT_EQ(keyCount, 0U);
+    proxy->Stop();
+}
+
 TEST_F(TestMmcMetaManager, BatchQuerySsdEvictionWakesPendingAndPreservesOtherKeys)
 {
     constexpr uint64_t defaultTtlMs = 2000U;

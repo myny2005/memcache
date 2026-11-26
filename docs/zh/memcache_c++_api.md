@@ -344,14 +344,15 @@ virtual std::vector<int> BatchPutFromWithParents(
 
 **Function**
 
-Same write behavior as `BatchPutFrom`, with parent keys forwarded to MetaService. Parent-child relationships are
-not applied or validated yet; allocation, copying, retries, and result handling are unchanged.
+Same write behavior as `BatchPutFrom`, with validated parent paths forwarded to MetaService. Parent-child metadata is
+not applied yet. Allocation, copying, and result handling otherwise match `BatchPutFrom`.
 
 **parameter**
 
-- `keys`: Flat key list, grouped into consecutive equal-length paths.
-- `parents`: Parent keys, one per path. For `keys=[A,B,C,D,E,F]` and `parents=[X,Y]`, the intended paths are
-  `X -> A -> B -> C` and `Y -> D -> E -> F`. This mapping is not used yet.
+- `keys`: Flat list of unique keys, grouped into consecutive equal-length paths.
+- `parents`: Non-empty parent-key list, one per path. An empty string denotes a root path. For
+  `keys=[A,B,C,D,E,F]` and `parents=[X,Y]`, the paths are `X -> A -> B -> C` and `Y -> D -> E -> F`.
+- `keys.size()` must be divisible by `parents.size()`. A non-empty parent must not also occur in `keys`.
 - `buffers`, `sizes`, `replicateConfig`: Same meaning as in `BatchPutFrom`.
 - `direct`: Same meaning and default as in `BatchPutFrom`; the default is `3` (H2G).
 

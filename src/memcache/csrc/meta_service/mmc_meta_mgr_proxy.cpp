@@ -10,6 +10,7 @@
  * See the Mulan PSL v2 for more details.
 */
 #include "mmc_meta_mgr_proxy.h"
+#include "mmc_parent_path.h"
 #include "mmc_ptracer.h"
 
 #include <algorithm>
@@ -136,11 +137,23 @@ Result MmcMetaMgrProxy::BatchAlloc(const BatchAllocRequest &req, BatchAllocRespo
 
 Result MmcMetaMgrProxy::BatchAllocWithParents(const BatchAllocWithParentsRequest &req, BatchAllocResponse &resp)
 {
-    // Parent keys arrive in req.parents; applying parent-child relationships is intentionally deferred.
     MmcMetaMetricManager &metricManager = MmcMetaMetricManager::GetInstance();
     metricManager.IncrementRequestCounter(RestMetricType::BATCH_ALLOC, UINT32_MAX);
     resp.results_.resize(req.keys.size());
     resp.blobs_.resize(req.keys.size());
+    ParentPathLayout parentPathLayout;
+    if (ValidateParentPaths(req.keys, req.parents, parentPathLayout) != MMC_OK) {
+        metricManager.IncrementFailureCounter(RestMetricType::BATCH_ALLOC);
+        MMC_LOG_ERROR("BatchAllocWithParents invalid parent paths, key count: " << req.keys.size()
+                                                                                  << ", parent count: "
+                                                                                  << req.parents.size());
+        resp.numBlobs_.assign(req.keys.size(), 0);
+        resp.prots_.assign(req.keys.size(), 0);
+        resp.priorities_.assign(req.keys.size(), 0);
+        resp.leases_.assign(req.keys.size(), 0);
+        std::fill(resp.results_.begin(), resp.results_.end(), MMC_INVALID_PARAM);
+        return MMC_INVALID_PARAM;
+    }
     if (req.keys.size() != req.options.size()) {
         metricManager.IncrementFailureCounter(RestMetricType::BATCH_ALLOC);
         MMC_LOG_ERROR("BatchAlloc input size mismatch, key count: " << req.keys.size()
