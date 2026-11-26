@@ -239,11 +239,37 @@ public:
         return ShardOf(key).RemoveFromLru(key, type);
     }
 
+    size_t EvictPreferredCandidates(const std::vector<Key> &keys,
+                                    std::function<EvictResult(const Key &, const Value &, MediaType)> moveFunc,
+                                    MediaType mediaType, uint32_t yieldInterval = 0,
+                                    uint32_t yieldDurationUs = 0) override
+    {
+        if (mediaType >= MEDIA_NONE || mediaType == MEDIA_SSD) {
+            return 0;
+        }
+        std::vector<std::vector<Key>> shardKeys(shards_.size());
+        for (const auto &key : keys) {
+            shardKeys[ShardIndex(key)].push_back(key);
+        }
+
+        size_t evicted = 0;
+        for (size_t shard = 0; shard < shards_.size(); ++shard) {
+            if (shardKeys[shard].empty()) {
+                continue;
+            }
+            evicted += shards_[shard]->EvictPreferredCandidates(shardKeys[shard], moveFunc, mediaType,
+                                                                 yieldInterval, yieldDurationUs);
+        }
+        return evicted;
+    }
+
     void MultiLevelElimination(const std::vector<std::pair<uint16_t, uint16_t>> &evictWatermarks,
                                const std::vector<MediaType> &needEvictList,
-                               const std::vector<uint16_t> &nowMemoryThresholds,
-                               std::function<EvictResult(const Key &, const Value &, MediaType)> moveFunc,
-                               uint32_t yieldInterval = 0, uint32_t yieldDurationUs = 0) override
+                                const std::vector<uint16_t> &nowMemoryThresholds,
+                                std::function<EvictResult(const Key &, const Value &, MediaType)> moveFunc,
+                                uint32_t yieldInterval = 0, uint32_t yieldDurationUs = 0,
+                                std::function<std::vector<Key>(MediaType, size_t)> preferredKeyProvider = {},
+                                std::function<void(size_t, size_t, size_t)> preferredEvictionReporter = {}) override
     {
         for (size_t i = 0; i < needEvictList.size(); ++i) {
             const MediaType mediaType = needEvictList[i];
@@ -279,12 +305,28 @@ public:
                 std::max(std::min(candidateCount * static_cast<size_t>(nowThreshold - low) / high, candidateCount),
                          static_cast<size_t>(1));
 
+            size_t prefixEvicted = 0;
+            size_t preferredAttempted = 0;
+            if (preferredKeyProvider) {
+                const auto preferredKeys = preferredKeyProvider(mediaType, numEvictObjs);
+                preferredAttempted = preferredKeys.size();
+                prefixEvicted =
+                    EvictPreferredCandidates(preferredKeys, moveFunc, mediaType, yieldInterval, yieldDurationUs);
+            }
+            if (prefixEvicted >= numEvictObjs) {
+                if (preferredEvictionReporter && preferredKeyProvider) {
+                    preferredEvictionReporter(preferredAttempted, prefixEvicted, 0U);
+                }
+                continue;
+            }
+            const size_t remainingTarget = numEvictObjs - prefixEvicted;
+
             constexpr size_t kMinReserveSlack = 64;
             constexpr size_t kReserveSlackDivisor = 10;
             // 多拿一些候选，应对候选在执行前失效；
             const size_t reserveSlack =
-                std::max(kMinReserveSlack, (numEvictObjs + kReserveSlackDivisor - 1) / kReserveSlackDivisor);
-            const size_t reserveCount = std::min(candidateCount, numEvictObjs + reserveSlack);
+                std::max(kMinReserveSlack, (remainingTarget + kReserveSlackDivisor - 1) / kReserveSlackDivisor);
+            const size_t reserveCount = std::min(candidateCount, remainingTarget + reserveSlack);
 
             const auto coldSequences =
                 CollectGlobalColdSequences(mediaType, reserveCount, shardCandidateCounts, threadCount, shardsPerThread);
@@ -294,14 +336,14 @@ public:
             uint64_t targetCutoff = 0;
             uint64_t reserveCutoff = 0;
             bool recoveredFullPopulation = false;
-            if (coldSequences.size() >= numEvictObjs) {
-                targetCutoff = coldSequences[numEvictObjs - 1];
+            if (coldSequences.size() >= remainingTarget) {
+                targetCutoff = coldSequences[remainingTarget - 1U];
                 reserveCutoff = coldSequences.back();
                 candidates = CollectCandidates(mediaType, reserveCutoff, true, threadCount, shardsPerThread);
             }
 
             // 正常候选不够目标数，说明两个阶段之间发生了较严重的并发变化， 重新收集candidate
-            if (candidates.size() < numEvictObjs) {
+            if (candidates.size() < remainingTarget) {
                 candidates = CollectCandidates(mediaType, std::numeric_limits<uint64_t>::max(), true, threadCount,
                                                shardsPerThread);
                 recoveredFullPopulation = true;
@@ -310,7 +352,7 @@ public:
                 continue;
             }
 
-            const size_t targetCount = std::min(numEvictObjs, candidates.size());
+            const size_t targetCount = std::min(remainingTarget, candidates.size());
             if (recoveredFullPopulation) {
                 // 这是一个很少触发的路径：在 key 物化之前，有界快照已经发生了变化。进入全量重收集之后，candidates 是 当前所有可淘汰对象，要重新计算 targetCutoff
                 auto targetIter = candidates.begin() + (targetCount - 1);
@@ -339,25 +381,28 @@ public:
             // 阶段 3：在候选项所属 shard 的锁保护下重新校验。
             // 从候选收集到真正执行之间，候选项可能已经被提升、删除，或移动到了其他位置。
             // 如果发生这种情况，就使用 reserve candidate 补足目标数量。
-            size_t evicted = 0;
+            size_t lruEvicted = 0;
             size_t attempted = 0;
-            EvictCandidates(primaryCandidates, targetCount, evicted, attempted, moveFunc, mediaType, yieldInterval,
-                            yieldDurationUs);
-            if (evicted < targetCount) {
-                EvictCandidates(reserveCandidates, targetCount, evicted, attempted, moveFunc, mediaType, yieldInterval,
-                                yieldDurationUs);
+            EvictCandidates(primaryCandidates, targetCount, lruEvicted, attempted, moveFunc, mediaType, yieldInterval,
+                             yieldDurationUs);
+            if (lruEvicted < targetCount) {
+                EvictCandidates(reserveCandidates, targetCount, lruEvicted, attempted, moveFunc, mediaType,
+                                yieldInterval, yieldDurationUs);
             }
-            if (evicted < targetCount && !recoveredFullPopulation && reserveCount < candidateCount) {
+            if (lruEvicted < targetCount && !recoveredFullPopulation && reserveCount < candidateCount) {
                 // 因为并发 Get/Promote、删除、换介质等，很多候选在真正淘汰时已失效，EvictCandidate 返回 FAIL。主候选和备用候选都试完后，实际淘汰数还没达到 targetCount
                 // 在这条少见的恢复路径中，仍然会扫描剩余候选， 继续尝试淘汰，直到达到 targetCount 或候选耗尽
                 // 但扫描过程会并行执行。
                 auto refillCandidates =
                     CollectCandidates(mediaType, reserveCutoff, false, threadCount, shardsPerThread);
-                EvictCandidates(refillCandidates, targetCount, evicted, attempted, moveFunc, mediaType, yieldInterval,
-                                yieldDurationUs);
+                EvictCandidates(refillCandidates, targetCount, lruEvicted, attempted, moveFunc, mediaType,
+                                yieldInterval, yieldDurationUs);
             }
-            MMC_LOG_INFO("Evicted " << evicted << " keys from " << mediaType << ". Candidate count: " << candidateCount
-                                    << ".");
+            if (preferredEvictionReporter && preferredKeyProvider) {
+                preferredEvictionReporter(preferredAttempted, prefixEvicted, lruEvicted);
+            }
+            MMC_LOG_INFO("Evicted " << (prefixEvicted + lruEvicted) << " keys from " << mediaType
+                                     << ". Candidate count: " << candidateCount << ".");
         }
     }
 

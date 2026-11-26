@@ -41,6 +41,7 @@ constexpr auto OCK_MMC_META_LEASE_TTL_MS = std::make_pair("ock.mmc.meta.lease_tt
 constexpr auto OCK_MMC_META_LRU_SHARD_COUNT =
     std::make_pair("ock.mmc.meta_service.lru_shard_count", MMC_DEFAULT_META_LRU_SHARD_COUNT);
 constexpr auto OCK_MMC_META_LRU_TYPE = std::make_pair("ock.mmc.meta_service.lru_type", "sharded_lru");
+constexpr auto OCK_MMC_PREFIX_EVICTION_ENABLED = std::make_pair("ock.mmc.meta_service.prefix_eviction.enabled", false);
 constexpr auto OCK_MMC_META_NET_POOL_BASE =
     std::make_pair("ock.mmc.meta_service.net_pool_base", MMC_DEFAULT_META_NET_POOL_BASE);
 constexpr auto OKC_MMC_LOCAL_SERVICE_BACKEND_ID = std::make_pair("ock.mmc.local_service.backend_id", "");

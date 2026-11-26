@@ -115,6 +115,15 @@ MmcMetaMetricManager::MmcMetaMetricManager()
       rewarmBytesCounter_("memcache_rewarm_bytes_total", "Total bytes rewarmed from SSD to DRAM"),
       rewarmBytesCurrentGauge_("memcache_rewarm_bytes_current", "Current bytes occupied by rewarmed data"),
       keyCountGauge_("memcache_stored_keys", "Current number of stored keys"),
+      prefixTreeNodeGauge_("memcache_prefix_tree_nodes", "Current number of prefix-tree nodes"),
+      prefixTreeOrphanGauge_("memcache_prefix_tree_orphans", "Current number of prefix-tree orphan nodes"),
+      prefixTreeParentConflictGauge_("memcache_prefix_tree_parent_conflicts", "Observed prefix-tree parent conflicts"),
+      prefixTreeStaleHeapPopGauge_("memcache_prefix_tree_stale_heap_pops", "Discarded stale prefix-tree heap entries"),
+      prefixTreeLeafCandidateGauge_("memcache_prefix_tree_leaf_candidates", "Returned prefix-tree leaf candidates"),
+      prefixEvictionAttemptCounter_("memcache_prefix_eviction_attempts_total", "Prefix eviction candidate attempts"),
+      prefixEvictionSuccessCounter_("memcache_prefix_eviction_success_total", "Successful prefix-selected evictions"),
+      prefixEvictionLruFallbackCounter_("memcache_prefix_eviction_lru_fallback_total",
+                                        "Eviction slots completed through ordinary LRU"),
       asyncFlushBlobAddedCounter_("memcache_flush_blobs_total", "Total number of SSD blobs registered via async flush"),
       asyncFlushBlobBytesCounter_("memcache_flush_bytes_total", "Total bytes flushed to SSD via async flush"),
       localFirstFallbackCounter_("memcache_local_first_fallback_total",
@@ -195,6 +204,14 @@ MmcMetaMetricSnapshot MmcMetaMetricManager::GetSnapshot() const
     snapshot.asyncFlushBlobAdded = static_cast<uint64_t>(asyncFlushBlobAddedCounter_.value());
     snapshot.asyncFlushBlobBytes = static_cast<uint64_t>(asyncFlushBlobBytesCounter_.value());
     snapshot.localFirstFallbackCount = static_cast<uint64_t>(localFirstFallbackCounter_.value());
+    snapshot.prefixTreeNodeCount = static_cast<uint64_t>(prefixTreeNodeGauge_.value());
+    snapshot.prefixTreeOrphanCount = static_cast<uint64_t>(prefixTreeOrphanGauge_.value());
+    snapshot.prefixTreeParentConflictCount = static_cast<uint64_t>(prefixTreeParentConflictGauge_.value());
+    snapshot.prefixTreeStaleHeapPopCount = static_cast<uint64_t>(prefixTreeStaleHeapPopGauge_.value());
+    snapshot.prefixTreeLeafCandidateCount = static_cast<uint64_t>(prefixTreeLeafCandidateGauge_.value());
+    snapshot.prefixEvictionAttemptCount = static_cast<uint64_t>(prefixEvictionAttemptCounter_.value());
+    snapshot.prefixEvictionSuccessCount = static_cast<uint64_t>(prefixEvictionSuccessCounter_.value());
+    snapshot.prefixEvictionLruFallbackCount = static_cast<uint64_t>(prefixEvictionLruFallbackCounter_.value());
 
     // per-rank internal counters
     if (IsPerRankEnabled()) {

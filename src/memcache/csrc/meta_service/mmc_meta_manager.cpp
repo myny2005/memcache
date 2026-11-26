@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <map>
 #include <memory>
 #include <random>
@@ -134,6 +135,9 @@ Result MmcMetaManager::Get(const std::string &key, uint64_t operateId, MmcBlobFi
     TP_TRACE_BEGIN(TP_MMC_META_GET_FILL_METAOBJ);
     ret = ResolveAndFillMetaDesc(key, operateId, filterPtr, memObj, objMeta);
     TP_TRACE_END(TP_MMC_META_GET_FILL_METAOBJ, ret);
+    if (ret == MMC_OK && objMeta.numBlobs_ != 0U) {
+        TouchPrefixNode(key);
+    }
     return ret;
 }
 
@@ -361,6 +365,13 @@ Result MmcMetaManager::GetByRank(const std::vector<std::string> &keys, uint64_t 
             f.get();
         } catch (const std::exception &e) {
             MMC_LOG_WARN("GetByRank future failed: " << e.what());
+        }
+    }
+    if (classifyRet == MMC_OK) {
+        for (size_t index = 0; index < keyCount; ++index) {
+            if (objMetas[index].numBlobs_ != 0U) {
+                TouchPrefixNode(keys[index]);
+            }
         }
     }
     return classifyRet;
@@ -627,12 +638,16 @@ void MmcMetaManager::RollbackEntry(const std::string &key, const MmcMemObjMetaPt
     auto blobs = rbFilter != nullptr ? memObj->DetachBlobs(rbFilter) : std::vector<MmcMemBlobPtr>{};
     guard.unlock();
     memObj->FinalizeBlobs(key, globalAllocator_, blobs, false);
-    metaContainer_->EraseIfEmpty(key, [&memObj, &guard](const MmcMemObjMetaPtr &current) {
+    metaContainer_->EraseIfEmpty(key, [this, &key, &memObj, &guard](const MmcMemObjMetaPtr &current) {
         if (current.Get() != memObj.Get()) {
             return false;
         }
         guard.lock();
-        return current->NumBlobs() == 0;
+        const bool isEmpty = current->NumBlobs() == 0;
+        if (isEmpty) {
+            RemovePrefixNodeIfMatch(key, current);
+        }
+        return isEmpty;
     });
     if (!guard.owns_lock()) {
         guard.lock();
@@ -696,12 +711,16 @@ Result MmcMetaManager::ApplyRewarm(const std::string &key, const MmcMemObjMetaPt
         auto blobs = memObj->DetachBlobs(rbFilter);
         guard.unlock();
         memObj->FinalizeBlobs(key, globalAllocator_, blobs, false);
-        metaContainer_->EraseIfEmpty(key, [&memObj, &guard](const MmcMemObjMetaPtr &current) {
+        metaContainer_->EraseIfEmpty(key, [this, &key, &memObj, &guard](const MmcMemObjMetaPtr &current) {
             if (current.Get() != memObj.Get()) {
                 return false;
             }
             guard.lock();
-            return current->NumBlobs() == 0;
+            const bool isEmpty = current->NumBlobs() == 0;
+            if (isEmpty) {
+                RemovePrefixNodeIfMatch(key, current);
+            }
+            return isEmpty;
         });
         if (!guard.owns_lock()) {
             guard.lock();
@@ -722,12 +741,16 @@ Result MmcMetaManager::ApplyRewarm(const std::string &key, const MmcMemObjMetaPt
             auto blobs = memObj->DetachBlobs(rbFilter);
             guard.unlock();
             memObj->FinalizeBlobs(key, globalAllocator_, blobs, false);
-            metaContainer_->EraseIfEmpty(key, [&memObj, &guard](const MmcMemObjMetaPtr &current) {
+            metaContainer_->EraseIfEmpty(key, [this, &key, &memObj, &guard](const MmcMemObjMetaPtr &current) {
                 if (current.Get() != memObj.Get()) {
                     return false;
                 }
                 guard.lock();
-                return current->NumBlobs() == 0;
+                const bool isEmpty = current->NumBlobs() == 0;
+                if (isEmpty) {
+                    RemovePrefixNodeIfMatch(key, current);
+                }
+                return isEmpty;
             });
             if (!guard.owns_lock()) {
                 guard.lock();
@@ -1038,18 +1061,56 @@ void MmcMetaManager::CheckAndEvict(MediaType media, uint64_t wantAllocSize)
                            MediaType srcMediaType) -> EvictResult {
         return this->EvictCallBackFunction(key, objMeta, srcMediaType);
     };
+    std::function<std::vector<std::string>(MediaType, size_t)> preferredKeyProvider;
+    std::function<void(size_t, size_t, size_t)> preferredEvictionReporter;
+    if (extConfig_.prefixEvictionEnabled) {
+        preferredKeyProvider = [this](MediaType mediaType, size_t targetCount) {
+            std::vector<std::string> keys;
+            if (targetCount == 0U) {
+                return keys;
+            }
+            constexpr size_t kPrefixCandidateMultiplier = 4U;
+            const size_t maxTargetCount = std::numeric_limits<size_t>::max() / kPrefixCandidateMultiplier;
+            const size_t attemptLimit = targetCount > maxTargetCount ? std::numeric_limits<size_t>::max()
+                                                                     : targetCount * kPrefixCandidateMultiplier;
+            keys.reserve(targetCount);
+            for (size_t attempt = 0; attempt < attemptLimit && keys.size() < targetCount; ++attempt) {
+                PrefixTreeCandidate candidate;
+                if (!prefixTreeIndex_.PopLeafCandidate(candidate)) {
+                    break;
+                }
+                // PopLeafCandidate releases the index lock before this normal container lookup. The container
+                // validates identity and tier again while performing eviction.
+                if (metaContainer_->GetMediaType(candidate.key) == mediaType) {
+                    keys.push_back(std::move(candidate.key));
+                }
+            }
+            PublishPrefixTreeMetrics();
+            return keys;
+        };
+        preferredEvictionReporter = [](size_t attempted, size_t succeeded, size_t lruFallback) {
+            auto &metricManager = MmcMetaMetricManager::GetInstance();
+            metricManager.IncrementPrefixEvictionAttemptCounter(attempted);
+            metricManager.IncrementPrefixEvictionSuccessCounter(succeeded);
+            metricManager.IncrementPrefixEvictionLruFallbackCounter(lruFallback);
+        };
+    }
 
     auto evictFuture = threadPool_->Enqueue(
         [&](const std::vector<std::pair<uint16_t, uint16_t>> &evictWatermarksL,
             const std::vector<MediaType> &needEvictListL, const std::vector<uint16_t> &nowMemoryThresholds,
             const std::function<EvictResult(const std::string &key, const MmcMemObjMetaPtr &objMeta, MediaType)>
-                &moveFuncL) {
+                &moveFuncL,
+             const std::function<std::vector<std::string>(MediaType, size_t)> &preferredKeyProviderL,
+             const std::function<void(size_t, size_t, size_t)> &preferredEvictionReporterL) {
             metaContainer_->MultiLevelElimination(evictWatermarksL, needEvictListL, nowMemoryThresholds, moveFuncL,
-                                                  evictYieldInterval_, evictYieldDurationUs_);
+                                                  evictYieldInterval_, evictYieldDurationUs_, preferredKeyProviderL,
+                                                  preferredEvictionReporterL);
             bool expected = true;
             evictCheck_.compare_exchange_strong(expected, false);
         },
-        evictWatermarks, needEvictList, nowMemoryThresholds, moveFunc);
+        evictWatermarks, needEvictList, nowMemoryThresholds, moveFunc, preferredKeyProvider,
+        preferredEvictionReporter);
     if (!evictFuture.valid()) {
         MMC_LOG_ERROR("submit evict task failed");
         evictCheck_.store(false);
@@ -1591,9 +1652,85 @@ Result MmcMetaManager::UpdateState(const std::string &key, const MmcLocation &lo
     for (const auto &b : storedBlobs) {
         KvEventStored(key, b.first, b.second);
     }
+    if (actRet == MMC_WRITE_OK && result == MMC_OK && !storedBlobs.empty()) {
+        uint64_t generation = 0;
+        const Result prefixRet = prefixTreeIndex_.MarkReady(key, generation);
+        if (prefixRet != MMC_OK && prefixRet != MMC_OBJECT_NOT_EXISTS) {
+            MMC_LOG_WARN("UpdateState: unable to mark prefix node ready, key=" << key << ", ret=" << prefixRet);
+        }
+    }
     MMC_LOG_DEBUG("UpdateState exit, key=" << key << ", loc=" << loc << ", action=" << static_cast<uint32_t>(actRet)
-                                           << ", result=" << result);
+                                            << ", result=" << result);
     return result;
+}
+
+Result MmcMetaManager::RegisterPrefixPending(const std::string &key, const std::string &parentKey)
+{
+    MmcMemObjMetaPtr meta;
+    const Result getRet = metaContainer_->Get(key, meta);
+    if (getRet != MMC_OK || meta == nullptr) {
+        return getRet == MMC_OK ? MMC_UNMATCHED_KEY : getRet;
+    }
+
+    std::lock_guard<std::mutex> lock(prefixTreeRegistrationMutex_);
+    const auto existing = prefixTreeRegistrations_.find(key);
+    if (existing != prefixTreeRegistrations_.end() && existing->second.meta.Get() == meta.Get()) {
+        return MMC_OK;
+    }
+    if (existing != prefixTreeRegistrations_.end()) {
+        const Result removeRet = prefixTreeIndex_.RemoveIfGeneration(key, existing->second.generation);
+        if (removeRet != MMC_OK && removeRet != MMC_OBJECT_NOT_EXISTS && removeRet != MMC_UNMATCHED_STATE) {
+            MMC_LOG_WARN("RegisterPrefixPending: unable to replace stale node, key=" << key << ", ret=" << removeRet);
+        }
+        prefixTreeRegistrations_.erase(existing);
+    }
+
+    PrefixTreeRegistration registration;
+    const Result registerRet = prefixTreeIndex_.RegisterPending(key, parentKey, registration);
+    if (registerRet != MMC_OK) {
+        return registerRet;
+    }
+    if (registration.status == PrefixTreeRegistrationStatus::PARENT_CONFLICT) {
+        MMC_LOG_WARN("RegisterPrefixPending: preserving first parent for key=" << key << ", requested parent="
+                                                                                 << parentKey);
+    }
+    prefixTreeRegistrations_.emplace(key, PrefixTreeRegistrationEntry{meta, registration.generation});
+    PublishPrefixTreeMetrics();
+    return MMC_OK;
+}
+
+void MmcMetaManager::TouchPrefixNode(const std::string &key)
+{
+    const Result ret = prefixTreeIndex_.Touch(key);
+    if (ret != MMC_OK && ret != MMC_OBJECT_NOT_EXISTS && ret != MMC_UNMATCHED_STATE) {
+        MMC_LOG_WARN("TouchPrefixNode: unable to touch key=" << key << ", ret=" << ret);
+    }
+}
+
+void MmcMetaManager::RemovePrefixNodeIfMatch(const std::string &key, const MmcMemObjMetaPtr &expected)
+{
+    if (expected == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(prefixTreeRegistrationMutex_);
+    const auto registration = prefixTreeRegistrations_.find(key);
+    if (registration == prefixTreeRegistrations_.end() || registration->second.meta.Get() != expected.Get()) {
+        return;
+    }
+    const Result ret = prefixTreeIndex_.RemoveIfGeneration(key, registration->second.generation);
+    if (ret != MMC_OK && ret != MMC_OBJECT_NOT_EXISTS && ret != MMC_UNMATCHED_STATE) {
+        MMC_LOG_WARN("RemovePrefixNodeIfMatch: unable to remove key=" << key << ", ret=" << ret);
+    }
+    prefixTreeRegistrations_.erase(registration);
+    PublishPrefixTreeMetrics();
+}
+
+void MmcMetaManager::PublishPrefixTreeMetrics() const
+{
+    const PrefixTreeIndexStats stats = prefixTreeIndex_.GetStats();
+    MmcMetaMetricManager::GetInstance().SetPrefixTreeStats(stats.nodeCount, stats.orphanCount,
+                                                            stats.parentConflictCount, stats.staleHeapPopCount,
+                                                            stats.leafCandidateCount);
 }
 
 bool MmcMetaManager::CheckActiveLease(const std::string &key, const MmcMemObjMetaPtr &meta,
@@ -1701,8 +1838,10 @@ Result MmcMetaManager::RemoveSsdBlob(const std::string &key, uint32_t rank)
     MMC_LOG_DEBUG("RemoveSsdBlob: key=" << key << ", rank=" << rank);
     if (objMeta->NumBlobs() == 0) {
         guard.unlock();
-        metaContainer_->Erase(key);
-        MMC_LOG_DEBUG("RemoveSsdBlob: key=" << key << " fully removed (no remaining blobs)");
+        if (metaContainer_->Erase(key) == MMC_OK) {
+            RemovePrefixNodeIfMatch(key, objMeta);
+            MMC_LOG_DEBUG("RemoveSsdBlob: key=" << key << " fully removed (no remaining blobs)");
+        }
     }
     return MMC_OK;
 }
@@ -1897,6 +2036,7 @@ Result MmcMetaManager::EraseAndRemove(const std::string &key)
         MMC_LOG_DEBUG("Erase returned null objMeta for key: " << key);
         return ret;
     }
+    RemovePrefixNodeIfMatch(key, objMeta);
     std::unique_lock<std::mutex> guard(objMeta->Mutex());
     PushRemoveList(key, objMeta, nullptr, true);
     return MMC_OK;
@@ -1914,6 +2054,7 @@ Result MmcMetaManager::EraseAndRemoveIfMatch(const std::string &key, const MmcMe
         MMC_LOG_DEBUG("EraseIfMatch failed for key: " << key << ", ret=" << ret);
         return ret;
     }
+    RemovePrefixNodeIfMatch(key, expected);
     std::unique_lock<std::mutex> guard(expected->Mutex());
     PushRemoveList(key, expected, nullptr, true);
     return MMC_OK;
@@ -1981,6 +2122,7 @@ Result MmcMetaManager::RemoveAll()
             MMC_LOG_ERROR("objMeta is null in RemoveAll for key: " << key);
             return;
         }
+        RemovePrefixNodeIfMatch(key, objMeta);
         std::unique_lock<std::mutex> guard(objMeta->Mutex());
         this->PushRemoveList(key, objMeta, nullptr, true);
     };
@@ -2144,6 +2286,7 @@ Result MmcMetaManager::RemoveBlobs(uint32_t rank, MediaType mediaType)
         const bool shouldErase = (objMeta->NumBlobs() == 0);
         if (shouldErase) {
             ++erasedKeys;
+            RemovePrefixNodeIfMatch(key, objMeta);
         }
         return shouldErase;
     };
@@ -2186,6 +2329,7 @@ Result MmcMetaManager::RemoveBlobsForDeadRank(uint32_t rank, MediaType mediaType
         const bool shouldErase = (objMeta->NumBlobs() == 0);
         if (shouldErase) {
             ++erasedKeys;
+            RemovePrefixNodeIfMatch(key, objMeta);
         }
         return shouldErase;
     };
@@ -2784,12 +2928,21 @@ EvictResult MmcMetaManager::DispatchMoveBlob(const std::string &key, const MmcMe
 }
 
 EvictResult MmcMetaManager::EvictCallBackFunction(const std::string &key, const MmcMemObjMetaPtr &objMeta,
-                                                  MediaType srcMediaType)
+                                                   MediaType srcMediaType)
 {
     if (objMeta == nullptr) {
         MMC_LOG_ERROR("objMeta is null");
         return EvictResult::FAIL;
     }
+
+    const auto trackRemoval = [this, &key, &objMeta](EvictResult result) {
+        if (result == EvictResult::REMOVE) {
+            // The container erases this exact object immediately after its callback returns REMOVE. Remove only the
+            // matching generation so a delayed eviction cannot affect a recreated key.
+            RemovePrefixNodeIfMatch(key, objMeta);
+        }
+        return result;
+    };
 
     TP_TRACE_BEGIN(TP_MMC_META_EVICT);
 
@@ -2820,7 +2973,7 @@ EvictResult MmcMetaManager::EvictCallBackFunction(const std::string &key, const 
         EvictResult res = EvictRemoveSrc(key, objMeta, memFilter, dstMedium);
         MMC_LOG_DEBUG("Evict keep-ssd key=" << key << " from " << srcMediaType << ", free memory only, ssd kept");
         TP_TRACE_END(TP_MMC_META_EVICT, MMC_OK);
-        return res;
+        return trackRemoval(res);
     }
     MmcBlobFilterPtr srcFilter = MmcMakeRef<MmcBlobFilter>(UINT32_MAX, srcMediaType, READABLE);
 
@@ -2831,23 +2984,23 @@ EvictResult MmcMetaManager::EvictCallBackFunction(const std::string &key, const 
         // READABLE path; skipping would block LRU eviction for every key.
         MMC_LOG_WARN("Evict ALLOCATED-only key=" << key << " from " << srcMediaType << ", remove unreadable blob");
         TP_TRACE_END(TP_MMC_META_EVICT, MMC_OK);
-        return EvictRemoveSrc(key, objMeta, srcMediaType, dstMedium);
+        return trackRemoval(EvictRemoveSrc(key, objMeta, srcMediaType, dstMedium));
     }
     uint32_t evictRank = evictBlobs[0].rank_;
     MmcMetaMetricManager::GetInstance().IncrementEvictCounter(evictRank);
 
     uint64_t freeSize = globalAllocator_->GetFreeSpace(dstMedium);
     if (freeSize < objMeta->Size()) {
-        MMC_LOG_DEBUG("Evict REMOVE key=" << key << " from " << srcMediaType
-                                          << " reason=no_space, freeSize=" << freeSize << ", need=" << objMeta->Size());
+        MMC_LOG_DEBUG("Evict REMOVE key=" << key << " from " << srcMediaType << " reason=no_space, freeSize="
+                                           << freeSize << ", need=" << objMeta->Size());
         TP_TRACE_END(TP_MMC_META_EVICT, MMC_OK);
-        return EvictRemoveSrc(key, objMeta, srcFilter, dstMedium);
+        return trackRemoval(EvictRemoveSrc(key, objMeta, srcFilter, dstMedium));
     }
 
     MmcLocation src{UINT32_MAX, srcMediaType};
     MmcLocation dst{UINT32_MAX, dstMedium};
     TP_TRACE_END(TP_MMC_META_EVICT, MMC_OK);
-    return DispatchMoveBlob(key, objMeta, srcFilter, src, dst, srcMediaType, dstMedium);
+    return trackRemoval(DispatchMoveBlob(key, objMeta, srcFilter, src, dst, srcMediaType, dstMedium));
 }
 
 Result MmcMetaManager::RewarmAllocBlob(const std::string &key, const MmcMemBlobDesc &srcDesc, MediaType dstMediaType,

@@ -267,6 +267,8 @@ public:
             VIntRange::Create(OCK_MMC_META_LRU_SHARD_COUNT.first, MIN_META_LRU_SHARD_COUNT, MAX_META_LRU_SHARD_COUNT),
             0);
         AddStrConf(OCK_MMC_META_LRU_TYPE, VStrEnum::Create(OCK_MMC_META_LRU_TYPE.first, META_LRU_TYPE_ENUM_STR), 0);
+        AddBoolConf(OCK_MMC_PREFIX_EVICTION_ENABLED,
+                    VStrEnum::Create(OCK_MMC_PREFIX_EVICTION_ENABLED.first, BOOL_ENUM_STR), 0);
         AddIntConf(
             OKC_MMC_EVICT_YIELD_INTERVAL,
             VIntRange::Create(OKC_MMC_EVICT_YIELD_INTERVAL.first, MIN_EVICT_YIELD_INTERVAL, MAX_EVICT_YIELD_INTERVAL),
@@ -373,7 +375,8 @@ public:
         config.leaseTtlMs = static_cast<uint64_t>(GetInt(ConfConstant::OCK_MMC_META_LEASE_TTL_MS));
         config.lruShardCount = static_cast<uint32_t>(GetInt(ConfConstant::OCK_MMC_META_LRU_SHARD_COUNT));
         config.lruType = GetString(ConfConstant::OCK_MMC_META_LRU_TYPE) == "sharded_lru" ? MMC_META_LRU_TYPE_SHARDED_LRU
-                                                                                         : MMC_META_LRU_TYPE_LRU;
+                                                                                          : MMC_META_LRU_TYPE_LRU;
+        config.prefixEvictionEnabled = GetBool(ConfConstant::OCK_MMC_PREFIX_EVICTION_ENABLED);
         config.evictYieldInterval = static_cast<uint32_t>(GetInt(ConfConstant::OKC_MMC_EVICT_YIELD_INTERVAL));
         config.evictYieldDurationUs = static_cast<uint32_t>(GetInt(ConfConstant::OKC_MMC_EVICT_YIELD_DURATION_US));
         config.logRotationFileSize = GetInt(ConfConstant::OCK_MMC_LOG_ROTATION_FILE_SIZE) * MB_NUM;

@@ -254,7 +254,15 @@ struct MmcMetaMetricSnapshot {
     uint64_t asyncFlushBlobAdded{0};     // SSD blobs successfully registered via async flush callback
     uint64_t asyncFlushBlobBytes{0};     // total bytes flushed via async flush
     uint64_t localFirstFallbackCount{0}; // times ALLOC_LOCAL_FIRST fell back to ALLOC_RANDOM because the
-                                         // target backendId had no free blob or its ranks went offline
+                                          // target backendId had no free blob or its ranks went offline
+    uint64_t prefixTreeNodeCount{0};
+    uint64_t prefixTreeOrphanCount{0};
+    uint64_t prefixTreeParentConflictCount{0};
+    uint64_t prefixTreeStaleHeapPopCount{0};
+    uint64_t prefixTreeLeafCandidateCount{0};
+    uint64_t prefixEvictionAttemptCount{0};
+    uint64_t prefixEvictionSuccessCount{0};
+    uint64_t prefixEvictionLruFallbackCount{0};
 
     // per-rank internal counters: key = rank ID, value = counter value
     // Only populated when MMC_ENABLE_PER_RANK_METRICS is enabled.
@@ -406,6 +414,27 @@ public:
     {
         keyCountGauge_ = static_cast<int64_t>(count);
     }
+    void SetPrefixTreeStats(size_t nodeCount, size_t orphanCount, uint64_t parentConflictCount,
+                            uint64_t staleHeapPopCount, uint64_t leafCandidateCount)
+    {
+        prefixTreeNodeGauge_ = static_cast<int64_t>(nodeCount);
+        prefixTreeOrphanGauge_ = static_cast<int64_t>(orphanCount);
+        prefixTreeParentConflictGauge_ = static_cast<int64_t>(parentConflictCount);
+        prefixTreeStaleHeapPopGauge_ = static_cast<int64_t>(staleHeapPopCount);
+        prefixTreeLeafCandidateGauge_ = static_cast<int64_t>(leafCandidateCount);
+    }
+    void IncrementPrefixEvictionAttemptCounter(uint64_t count)
+    {
+        prefixEvictionAttemptCounter_ += static_cast<int64_t>(count);
+    }
+    void IncrementPrefixEvictionSuccessCounter(uint64_t count)
+    {
+        prefixEvictionSuccessCounter_ += static_cast<int64_t>(count);
+    }
+    void IncrementPrefixEvictionLruFallbackCounter(uint64_t count)
+    {
+        prefixEvictionLruFallbackCounter_ += static_cast<int64_t>(count);
+    }
 
 public:
     static bool IsPerRankEnabled();
@@ -482,6 +511,14 @@ private:
     prometheus::simpleapi::counter_metric_t rewarmBytesCounter_;
     prometheus::simpleapi::gauge_metric_t rewarmBytesCurrentGauge_;
     prometheus::simpleapi::gauge_metric_t keyCountGauge_;
+    prometheus::simpleapi::gauge_metric_t prefixTreeNodeGauge_;
+    prometheus::simpleapi::gauge_metric_t prefixTreeOrphanGauge_;
+    prometheus::simpleapi::gauge_metric_t prefixTreeParentConflictGauge_;
+    prometheus::simpleapi::gauge_metric_t prefixTreeStaleHeapPopGauge_;
+    prometheus::simpleapi::gauge_metric_t prefixTreeLeafCandidateGauge_;
+    prometheus::simpleapi::counter_metric_t prefixEvictionAttemptCounter_;
+    prometheus::simpleapi::counter_metric_t prefixEvictionSuccessCounter_;
+    prometheus::simpleapi::counter_metric_t prefixEvictionLruFallbackCounter_;
 
     // per-rank counters (ranked)
     RankedOpMetrics rankedAlloc_;

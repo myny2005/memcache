@@ -201,6 +201,17 @@ Result MmcMetaMgrProxy::BatchAllocWithParents(const BatchAllocWithParentsRequest
             resp.priorities_.push_back(objMeta.priority_);
             resp.leases_.push_back(objMeta.blobs_.empty() ? 0 : objMeta.blobs_[0].leaseTimeoutTtlMs_);
             resp.blobs_[i] = objMeta.blobs_;
+            const size_t pathIndex = i / parentPathLayout.keysPerPath;
+            const size_t keyIndexInPath = i % parentPathLayout.keysPerPath;
+            const std::string &parentKey =
+                keyIndexInPath == 0U ? req.parents[pathIndex] : req.keys[i - 1U];
+            const Result prefixRet = metaMangerPtr_->RegisterPrefixPending(req.keys[i], parentKey);
+            if (prefixRet != MMC_OK) {
+                // The real allocation is authoritative. Prefix metadata is only an eviction-policy hint, so a failed
+                // registration must not turn a successful Put into a data-path failure.
+                MMC_LOG_WARN("BatchAllocWithParents: unable to register prefix node for key="
+                             << req.keys[i] << ", ret=" << prefixRet);
+            }
         }
         resp.results_[i] = ret;
     }

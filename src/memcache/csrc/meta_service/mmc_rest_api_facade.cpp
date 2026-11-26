@@ -948,6 +948,27 @@ Result MmcRestApiFacade::BuildPrometheusMetrics(bool serviceReady, std::string &
     AppendMetricHeader(oss, "memcache_evict_running", "Whether eviction (GC) is currently running (1=yes, 0=no)",
                        "gauge");
     AppendMetricValue(oss, "memcache_evict_running", metaManager_ != nullptr && metaManager_->IsEvictRunning() ? 1 : 0);
+    AppendMetricHeader(oss, "memcache_prefix_tree_nodes", "Current number of prefix-tree nodes", "gauge");
+    AppendMetricValue(oss, "memcache_prefix_tree_nodes", metricSnapshot.prefixTreeNodeCount);
+    AppendMetricHeader(oss, "memcache_prefix_tree_orphans", "Current number of prefix-tree orphan nodes", "gauge");
+    AppendMetricValue(oss, "memcache_prefix_tree_orphans", metricSnapshot.prefixTreeOrphanCount);
+    AppendMetricHeader(oss, "memcache_prefix_tree_parent_conflicts", "Observed prefix-tree parent conflicts", "gauge");
+    AppendMetricValue(oss, "memcache_prefix_tree_parent_conflicts", metricSnapshot.prefixTreeParentConflictCount);
+    AppendMetricHeader(oss, "memcache_prefix_tree_stale_heap_pops", "Discarded stale prefix-tree heap entries",
+                       "gauge");
+    AppendMetricValue(oss, "memcache_prefix_tree_stale_heap_pops", metricSnapshot.prefixTreeStaleHeapPopCount);
+    AppendMetricHeader(oss, "memcache_prefix_tree_leaf_candidates", "Returned prefix-tree leaf candidates", "gauge");
+    AppendMetricValue(oss, "memcache_prefix_tree_leaf_candidates", metricSnapshot.prefixTreeLeafCandidateCount);
+    AppendMetricHeader(oss, "memcache_prefix_eviction_attempts_total", "Prefix eviction candidate attempts",
+                       "counter");
+    AppendMetricValue(oss, "memcache_prefix_eviction_attempts_total", metricSnapshot.prefixEvictionAttemptCount);
+    AppendMetricHeader(oss, "memcache_prefix_eviction_success_total", "Successful prefix-selected evictions",
+                       "counter");
+    AppendMetricValue(oss, "memcache_prefix_eviction_success_total", metricSnapshot.prefixEvictionSuccessCount);
+    AppendMetricHeader(oss, "memcache_prefix_eviction_lru_fallback_total",
+                       "Eviction slots completed through ordinary LRU", "counter");
+    AppendMetricValue(oss, "memcache_prefix_eviction_lru_fallback_total",
+                      metricSnapshot.prefixEvictionLruFallbackCount);
     AppendMetricHeader(oss, "memcache_flush_blobs_total", "Total number of SSD blobs registered via async flush",
                        "counter");
     AppendMetricValue(oss, "memcache_flush_blobs_total", metricSnapshot.asyncFlushBlobAdded);

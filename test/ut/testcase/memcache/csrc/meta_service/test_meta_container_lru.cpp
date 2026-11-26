@@ -49,6 +49,28 @@ TEST_F(TestMmcMetaContainerLRU, InsertAndGet)
     EXPECT_EQ(container->Get("key3", value), MMC_UNMATCHED_KEY);
 }
 
+TEST_F(TestMmcMetaContainerLRU, PreferredCandidatesValidateMediaBeforeEviction)
+{
+    constexpr int firstValue = 100;
+    constexpr int preferredValue = 200;
+    constexpr size_t expectedEvictedCount = 1U;
+    EXPECT_EQ(container->Insert("first", firstValue), MMC_OK);
+    EXPECT_EQ(container->Insert("preferred", preferredValue), MMC_OK);
+
+    std::vector<std::string> evictedKeys;
+    const auto moveFunc = [&evictedKeys](const std::string &key, const int &, MediaType) -> EvictResult {
+        evictedKeys.push_back(key);
+        return EvictResult::REMOVE;
+    };
+    EXPECT_EQ(container->EvictPreferredCandidates({"missing", "preferred"}, moveFunc, MEDIA_DRAM),
+              expectedEvictedCount);
+    EXPECT_EQ(evictedKeys, (std::vector<std::string>{"preferred"}));
+
+    int value = 0;
+    EXPECT_EQ(container->Get("first", value), MMC_OK);
+    EXPECT_EQ(container->Get("preferred", value), MMC_UNMATCHED_KEY);
+}
+
 // After key recreation, KEEP_SSD parking of the old object must not affect the new object.
 TEST_F(TestMmcMetaContainerLRU, InsertLruIfMatchSkipsReplacedObject)
 {

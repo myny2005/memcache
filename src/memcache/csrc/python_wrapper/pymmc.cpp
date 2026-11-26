@@ -466,7 +466,9 @@ void DefineMmcStructModule(py::module_ &m)
                     Takes effect only when lru_type is sharded_lru.
                 )pbdoc")
             .def_readwrite("lru_type", &mmc_meta_service_config_t::lruType,
-                           "Meta LRU type: 0=lru, 1=sharded_lru (default).")
+                            "Meta LRU type: 0=lru, 1=sharded_lru (default).")
+            .def_readwrite("prefix_eviction_enabled", &mmc_meta_service_config_t::prefixEvictionEnabled,
+                           "Prefer prefix-tree leaves before ordinary LRU during normal watermark eviction.")
             .def_readwrite("lease_ttl_ms", &mmc_meta_service_config_t::leaseTtlMs,
                            R"pbdoc(
                     Default read lease TTL in milliseconds.

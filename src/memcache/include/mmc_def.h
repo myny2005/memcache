@@ -116,6 +116,8 @@ typedef struct {
     uint32_t allocStrategy;
     // MetaService 网络异步线程池线程数；0 表示使用默认值，有效范围 [4, 256]，重启生效。
     uint32_t netPoolBase;
+    // Enables best-effort prefix-aware candidate selection for normal watermark eviction. Disabled by default.
+    bool prefixEvictionEnabled;
 } mmc_meta_service_config_t;
 
 typedef struct {

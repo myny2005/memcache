@@ -32,6 +32,7 @@
 #include "mmc_meta_container.h"
 #include "mmc_meta_backup_mgr.h"
 #include "mmc_meta_net_server.h"
+#include "mmc_prefix_tree_index.h"
 #include "mmc_thread_pool.h"
 
 namespace ock {
@@ -126,6 +127,8 @@ struct MmcMemMetaDesc {
 
 struct MmcMetaExtConfig {
     bool prefetchEnabled = false;
+    // Disabled by default: normal eviction uses only LRU until prefix behavior is explicitly enabled.
+    bool prefixEvictionEnabled = false;
     uint64_t pendingWaitTimeoutMs = 300U;
 };
 
@@ -259,6 +262,15 @@ public:
      */
     Result UpdateState(const std::string &key, const MmcLocation &loc, const BlobActionResult &actRet,
                        uint64_t operateId);
+
+    // Prefix metadata is best-effort and independent from object/blob metadata. Parent-aware allocation invokes this
+    // only after the real allocation has succeeded.
+    Result RegisterPrefixPending(const std::string &key, const std::string &parentKey);
+
+    PrefixTreeIndexStats GetPrefixTreeIndexStats() const
+    {
+        return prefixTreeIndex_.GetStats();
+    }
 
     // Actual Remove outcome, allowing REST and other callers to count real behavior rather than infer from request
     // flags.
@@ -595,6 +607,10 @@ private:
     /* Delete and release all blobs only if key still maps to expected in the container. */
     Result EraseAndRemoveIfMatch(const std::string &key, const MmcMemObjMetaPtr &expected);
 
+    void RemovePrefixNodeIfMatch(const std::string &key, const MmcMemObjMetaPtr &expected);
+    void TouchPrefixNode(const std::string &key);
+    void PublishPrefixTreeMetrics() const;
+
     void PushRemoveList(const std::string &key, const MmcMemObjMetaPtr &meta, const MmcBlobFilterPtr &filter,
                         bool triggerSsdPreFree);
 
@@ -780,6 +796,11 @@ private:
         MediaType dstMedia = MEDIA_NONE;
     };
 
+    struct PrefixTreeRegistrationEntry {
+        MmcMemObjMetaPtr meta;
+        uint64_t generation{0};
+    };
+
     /**
      * @brief 为 SSD-only key 准备目标 DRAM Blob，并加入对应 rank 的回温分组
      * @param index            [in] key 在原始请求中的下标
@@ -851,6 +872,11 @@ private:
 
     MmcRef<MmcMetaContainer<std::string, MmcMemObjMetaPtr>> metaContainer_;
     MmcGlobalAllocatorPtr globalAllocator_;
+    PrefixTreeIndex prefixTreeIndex_;
+    // Associates the PrefixTreeIndex generation with the exact metadata object. This prevents a delayed removal for an
+    // old object from deleting a recreated key's index node.
+    mutable std::mutex prefixTreeRegistrationMutex_;
+    std::unordered_map<std::string, PrefixTreeRegistrationEntry> prefixTreeRegistrations_;
     // std::unordered_set<std::string> evictMap_;
     // ReadWriteLock evictMapLock_;
 

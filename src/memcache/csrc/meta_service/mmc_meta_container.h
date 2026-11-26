@@ -64,11 +64,21 @@ public:
     virtual Result InsertLruIfMatch(const Key &key, const Value &expected, MediaType type) = 0;
     virtual Result RemoveFromLru(const Key &key, MediaType type) = 0;
 
+    // Evict caller-supplied best-effort candidates while holding the container's normal identity/LRU locks. A
+    // candidate may be stale or belong to a different tier; implementations must validate it before moveFunc runs.
+    virtual size_t EvictPreferredCandidates(const std::vector<Key> &keys,
+                                            std::function<EvictResult(const Key &, const Value &, MediaType)> moveFunc,
+                                            MediaType mediaType, uint32_t yieldInterval = 0,
+                                            uint32_t yieldDurationUs = 0) = 0;
+
     virtual void MultiLevelElimination(const std::vector<std::pair<uint16_t, uint16_t>> &evictWatermarks,
-                                       const std::vector<MediaType> &needEvictList,
-                                       const std::vector<uint16_t> &nowMemoryThresholds,
-                                       std::function<EvictResult(const Key &, const Value &, MediaType)> moveFunc,
-                                       uint32_t yieldInterval = 0, uint32_t yieldDurationUs = 0) = 0;
+                                        const std::vector<MediaType> &needEvictList,
+                                        const std::vector<uint16_t> &nowMemoryThresholds,
+                                        std::function<EvictResult(const Key &, const Value &, MediaType)> moveFunc,
+                                        uint32_t yieldInterval = 0, uint32_t yieldDurationUs = 0,
+                                        std::function<std::vector<Key>(MediaType, size_t)> preferredKeyProvider = {},
+                                        std::function<void(size_t, size_t, size_t)> preferredEvictionReporter = {})
+        = 0;
     // yieldInterval: evict this many objects then sleep yieldDurationUs microseconds to release
     //                the write lock, allowing blocked requests to acquire the lock. 0 disables yield.
 

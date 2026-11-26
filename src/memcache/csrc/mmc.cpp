@@ -91,6 +91,7 @@ mmc_meta_service_config_t create_default_meta_config()
     config.evictCheckIntervalSeconds = 5U;
     config.lruType = MMC_META_LRU_TYPE_SHARDED_LRU;
     config.lruShardCount = MMC_DEFAULT_META_LRU_SHARD_COUNT;
+    config.prefixEvictionEnabled = false;
     config.netPoolBase = MMC_DEFAULT_META_NET_POOL_BASE;
     config.kvEvents.enable = false;
     config.kvEvents.transportType = static_cast<int32_t>(KV_EVENT_TRANSPORT::ZMQ);
@@ -125,6 +126,7 @@ std::string meta_config_to_string(const mmc_meta_service_config_t &config)
     oss << "  evict_check_interval_seconds: " << config.evictCheckIntervalSeconds << "\n";
     oss << "  lru_type: " << (config.lruType == MMC_META_LRU_TYPE_SHARDED_LRU ? "sharded_lru" : "lru") << "\n";
     oss << "  lru_shard_count: " << config.lruShardCount << "\n";
+    oss << "  prefix_eviction_enabled: " << (config.prefixEvictionEnabled ? "true" : "false") << "\n";
     oss << "  net_pool_base: " << config.netPoolBase << "\n";
     oss << "  kv_events_enable: " << (config.kvEvents.enable ? "true" : "false") << "\n";
     oss << "  kv_events_transport_type: " << config.kvEvents.transportType << "\n";

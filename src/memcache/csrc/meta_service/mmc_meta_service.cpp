@@ -133,6 +133,7 @@ Result MmcMetaService::Start(const mmc_meta_service_config_t &options)
     metaMgrProxy_ = MmcMakeRef<MmcMetaMgrProxy>(metaNetServer_).Get();
     MmcMetaExtConfig extConfig{};
     extConfig.prefetchEnabled = options.prefetchEnabled;
+    extConfig.prefixEvictionEnabled = options.prefixEvictionEnabled;
     extConfig.pendingWaitTimeoutMs = options_.pendingWaitTimeoutMs;
     MMC_RETURN_ERROR(metaMgrProxy_->Start(options_.leaseTtlMs, options.evictThresholdHigh, options.evictThresholdLow,
                                           extConfig, options.evictYieldInterval, options.evictYieldDurationUs,

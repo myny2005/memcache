@@ -509,6 +509,36 @@ public:
         return MMC_OK;
     }
 
+    size_t EvictPreferredCandidates(const std::vector<Key> &keys,
+                                    std::function<EvictResult(const Key &, const Value &, MediaType)> moveFunc,
+                                    MediaType mediaType, uint32_t yieldInterval = 0,
+                                    uint32_t yieldDurationUs = 0) override
+    {
+        if (mediaType >= MEDIA_NONE || mediaType == MEDIA_SSD) {
+            return 0;
+        }
+
+        size_t evicted = 0;
+        for (size_t index = 0; index < keys.size(); ++index) {
+            const Key &key = keys[index];
+            {
+                MmcWriteGuard metaGuard(metaLock_);
+                MmcWriteGuard lruGuard(lruLock_);
+                auto mapIter = metaMap_.find(key);
+                if (mapIter == metaMap_.end() || mapIter->second.mediaType_ != mediaType) {
+                    continue;
+                }
+                if (ApplyEvictResult(key, mapIter, moveFunc, mediaType)) {
+                    ++evicted;
+                }
+            }
+            if (yieldInterval > 0 && yieldDurationUs > 0 && (index + 1U) % yieldInterval == 0U) {
+                std::this_thread::sleep_for(std::chrono::microseconds(yieldDurationUs));
+            }
+        }
+        return evicted;
+    }
+
     bool EvictOneLeastRecentlyUsed(std::function<EvictResult(const Key &, const Value &, MediaType)> moveFunc,
                                    const MediaType mediaType)
     {
@@ -663,10 +693,12 @@ public:
     }
 
     void MultiLevelElimination(const std::vector<std::pair<uint16_t, uint16_t>> &evictWatermarks,
-                               const std::vector<MediaType> &needEvictList,
-                               const std::vector<uint16_t> &nowMemoryThresholds,
-                               std::function<EvictResult(const Key &, const Value &, MediaType)> moveFunc,
-                               uint32_t yieldInterval = 0, uint32_t yieldDurationUs = 0) override
+                                const std::vector<MediaType> &needEvictList,
+                                const std::vector<uint16_t> &nowMemoryThresholds,
+                                std::function<EvictResult(const Key &, const Value &, MediaType)> moveFunc,
+                                uint32_t yieldInterval = 0, uint32_t yieldDurationUs = 0,
+                                std::function<std::vector<Key>(MediaType, size_t)> preferredKeyProvider = {},
+                                std::function<void(size_t, size_t, size_t)> preferredEvictionReporter = {}) override
     {
         for (size_t i = 0; i < needEvictList.size(); ++i) {
             auto mediaType = needEvictList[i];
@@ -690,14 +722,27 @@ public:
             const size_t numEvictObjs =
                 std::max(std::min(oriNum * (nowThreshold - low) / high, oriNum), static_cast<size_t>(1));
 
-            for (size_t j = 0; j < numEvictObjs; ++j) {
-                EvictOneLeastRecentlyUsed(moveFunc, mediaType);
+            size_t evicted = 0;
+            size_t preferredAttempted = 0;
+            if (preferredKeyProvider) {
+                const auto preferredKeys = preferredKeyProvider(mediaType, numEvictObjs);
+                preferredAttempted = preferredKeys.size();
+                evicted = EvictPreferredCandidates(preferredKeys, moveFunc, mediaType, yieldInterval, yieldDurationUs);
+            }
+            size_t lruEvicted = 0;
+            for (size_t j = evicted; j < numEvictObjs; ++j) {
+                if (EvictOneLeastRecentlyUsed(moveFunc, mediaType)) {
+                    ++lruEvicted;
+                }
                 // Yield: periodically sleep to extend the lock-free window between evictions,
                 // giving blocked Put/Get/Exist threads enough time (~5us kernel scheduling)
                 // to wake up and acquire metaLock_ during the ~100us sleep window.
                 if (yieldInterval > 0 && yieldDurationUs > 0 && (j + 1) % yieldInterval == 0) {
                     std::this_thread::sleep_for(std::chrono::microseconds(yieldDurationUs));
                 }
+            }
+            if (preferredEvictionReporter && preferredKeyProvider) {
+                preferredEvictionReporter(preferredAttempted, evicted, lruEvicted);
             }
 
             MMC_LOG_INFO("Evicted " << numEvictObjs << " keys from " << mediaType << ". Number of keys: " << oriNum

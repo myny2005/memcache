@@ -235,6 +235,44 @@ TEST_F(TestMmcMetaManager, BatchAllocWithParentsRejectsMalformedPaths)
     proxy->Stop();
 }
 
+TEST_F(TestMmcMetaManager, PrefixTreeLifecycleTracksSuccessfulParentAwareAllocations)
+{
+    constexpr uint64_t defaultTtlMs = 2000U;
+    constexpr uint16_t highWatermark = 70U;
+    constexpr uint16_t lowWatermark = 60U;
+    constexpr uint32_t rank = 0U;
+    constexpr uint64_t baseGva = 0x100000U;
+    constexpr uint64_t capacity = 1048576U;
+    constexpr uint8_t replicaCount = 1U;
+    constexpr size_t expectedNodeCount = 2U;
+    constexpr size_t expectedRemainingNodeCount = 1U;
+    const MmcLocation location{rank, MEDIA_DRAM};
+    const AllocOptions options(SIZE_32K, replicaCount, MEDIA_DRAM, {rank}, ALLOC_RANDOM);
+    const uint64_t parentOperateId = GenerateOperateId(rank);
+    const uint64_t childOperateId = GenerateOperateId(rank);
+
+    auto manager = MmcMakeRef<MmcMetaManager>(defaultTtlMs, highWatermark, lowWatermark);
+    ASSERT_NE(manager, nullptr);
+    ASSERT_EQ(manager->Start(), MMC_OK);
+    std::vector<std::pair<std::string, MmcMemBlobDesc>> mountedBlobs;
+    ASSERT_EQ(manager->Mount(location, {baseGva, capacity}, mountedBlobs), MMC_OK);
+
+    MmcMemMetaDesc parentMeta;
+    ASSERT_EQ(manager->Alloc("A_k", options, parentOperateId, defaultTtlMs, parentMeta), MMC_OK);
+    ASSERT_EQ(manager->RegisterPrefixPending("A_k", ""), MMC_OK);
+    MmcMemMetaDesc childMeta;
+    ASSERT_EQ(manager->Alloc("B_k", options, childOperateId, defaultTtlMs, childMeta), MMC_OK);
+    ASSERT_EQ(manager->RegisterPrefixPending("B_k", "A_k"), MMC_OK);
+    EXPECT_EQ(manager->GetPrefixTreeIndexStats().nodeCount, expectedNodeCount);
+
+    ASSERT_EQ(manager->UpdateState("A_k", location, MMC_WRITE_OK, parentOperateId), MMC_OK);
+    ASSERT_EQ(manager->UpdateState("B_k", location, MMC_WRITE_OK, childOperateId), MMC_OK);
+    ASSERT_EQ(manager->Remove("B_k"), MMC_OK);
+    EXPECT_EQ(manager->GetPrefixTreeIndexStats().nodeCount, expectedRemainingNodeCount);
+
+    manager->Stop();
+}
+
 TEST_F(TestMmcMetaManager, BatchQuerySsdEvictionWakesPendingAndPreservesOtherKeys)
 {
     constexpr uint64_t defaultTtlMs = 2000U;
