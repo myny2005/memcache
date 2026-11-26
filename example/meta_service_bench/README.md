@@ -69,9 +69,8 @@ prefix (all components of every page must be readable), and writes only the miss
 `BatchAllocWithParentsRequest` followed by `BatchUpdateRequest(WRITE_OK)`. The write request is component-major, for
 example `keys=[C_k,D_k,C_v,D_v]`, `parents=[B_k,B_v]`.
 
-This exercises the parent-aware allocation API from MemCache PR #8. The current API transports parent paths; prefix
-tree persistence and leaf-only eviction must be implemented in MetaService separately before this workload can verify
-their correctness.
+This exercises parent-aware allocation and, with `--prefix-eviction`, normal watermark eviction that prefers ready
+prefix-tree leaves before ordinary LRU. The same workload can run without that option as an LRU baseline.
 
 ### Prefix workload options
 
@@ -86,6 +85,7 @@ their correctness.
 | `--request-pages N` | Logical page count per generated request. |
 | `--components N` | Physical components per logical page; `2` means K and V. |
 | `--seed N` | Deterministic request generator seed. |
+| `--prefix-eviction` | Enable prefix-leaf preference for normal watermark eviction. Default: off. |
 | `--validate-prefix-workload` | Run the pure generator self-check and exit. |
 
 ### Examples
@@ -104,6 +104,12 @@ their correctness.
 # Concurrent shared-prefix pressure run.
 ./build/example/meta_service_bench/bench_meta_service \
     --workload prefix_tree -p 4 -t 4 -n 10000 \
+    --prefix-depth 8 --prefix-fanout 16 --shared-prefix-percent 80 \
+    --shared-prefix-pages 3 --request-pages 6 --components 2 -c 128
+
+# Repeat with prefix-aware leaf eviction, then compare the prefix metrics with the previous LRU baseline.
+./build/example/meta_service_bench/bench_meta_service \
+    --workload prefix_tree --prefix-eviction -p 4 -t 4 -n 10000 \
     --prefix-depth 8 --prefix-fanout 16 --shared-prefix-percent 80 \
     --shared-prefix-pages 3 --request-pages 6 --components 2 -c 128
 ```

@@ -33,11 +33,8 @@ Primary requirements:
 
 - `review/hms-memcache-pr-8` at `03354fcb`: baseline parent-aware MemCache API. It transports `parents`, but does not
   persist a tree or change eviction.
-- `feature/prefix-tree-workload-simulator` at `9a0a1793`: separate benchmark branch. It adds the deterministic
-  prefix-tree MetaService benchmark.
 - `feature/prefix-parent-api-contract`: active branch for parent-path validation, retry correctness, prefix-index
-  lifecycle, and opt-in prefix-aware eviction. It starts from `review/hms-memcache-pr-8` and intentionally does not
-  contain the benchmark commit.
+  lifecycle, opt-in prefix-aware eviction, and the deterministic prefix-tree benchmark.
 
 ### SGLang
 
@@ -72,8 +69,8 @@ operateId
 leaseTtlMs
 ```
 
-The current MetaService path still allocates each key independently. It does not yet record parent relations, enforce
-parent availability, or make eviction parent-aware.
+MetaService allocates each physical key independently, records best-effort parent relations after successful
+parent-aware allocation, and can use ready leaves as normal-watermark eviction candidates.
 
 ### API contract and retry changes
 
@@ -148,7 +145,7 @@ the repository configuration requires clang-format 18 syntax.
 | Path | Responsibility |
 |---|---|
 | `example/meta_service_bench/bench_meta_service.cpp` | In-process MetaService + mock buffer-manager benchmark. |
-| `example/meta_service_bench/prefix_workload.{h,cpp}` | Deterministic shared-prefix request generator on the benchmark branch. |
+| `example/meta_service_bench/prefix_workload.{h,cpp}` | Deterministic shared-prefix request generator. |
 | `example/meta_service_bench/README.md` | Benchmark options and usage. |
 
 The benchmark is metadata/control-plane simulation only. It does not replace SGLang/NPU data-plane end-to-end testing.
@@ -283,7 +280,8 @@ not rewritten.
 - Existing logical-group work was created and pushed previously, but is not the intended final design.
 - SGLang PR #1 and MemCache PR #8 were fetched as review branches without merging into main/master.
 - Parent-aware SGLang-to-MemCache API direction was reviewed.
-- Prefix-tree synthetic benchmark was created and pushed separately on `feature/prefix-tree-workload-simulator`.
+- Prefix-tree synthetic benchmark is integrated into the active branch and can compare LRU against opt-in prefix leaf
+  eviction through `--prefix-eviction`.
 
 ### Completed API-contract stage
 
@@ -409,7 +407,8 @@ src/memcache/csrc/meta_service/mmc_meta_manager.cpp
 
 ### 6. Run benchmark pressure and concurrency scenarios
 
-Use `feature/prefix-tree-workload-simulator` after lifecycle and eviction integration.
+Use `example/meta_service_bench` from this branch. Run the same deterministic workload once without
+`--prefix-eviction` and once with it.
 
 Required scenarios:
 
@@ -439,9 +438,7 @@ Only after MetaService unit and simulator tests are stable:
   invalid `/share/cmake/pybind11` directory.
 - The local clang-format is 14, but `.clang-format` contains clang-format 18 configuration (`SortUsingDeclarations:
   Never`). Use clang-format 18 or repository CI for formatting validation.
-- The active PrefixTree/lifecycle/eviction work is uncommitted and has not been compiled locally.
-- Existing benchmark branch is separate from the API-contract branch; it will need rebase/cherry-pick/merge later, not
-  an accidental merge into main/master.
+- The active PrefixTree/lifecycle/eviction work has not been compiled locally.
 
 ### Concurrency and lifecycle
 

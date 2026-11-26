@@ -189,6 +189,7 @@ struct BenchConfig {
     uint32_t prefixRequestPages = kDefaultPrefixRequestPages;
     uint32_t prefixComponentCount = kDefaultPrefixComponentCount;
     uint64_t prefixSeed = kDefaultPrefixSeed;
+    bool prefixEvictionEnabled = false;
     bool validatePrefixWorkload = false;
 };
 
@@ -431,7 +432,14 @@ public:
                   << ", batch_alloc=" << Delta("memcache_batch_alloc_requests_total")
                   << ", batch_get=" << Delta("memcache_batch_get_requests_total") << "\n"
                   << "Stored keys: first=" << ValueOrZero(first, "memcache_stored_keys")
-                  << ", last=" << ValueOrZero(last, "memcache_stored_keys") << "\n";
+                  << ", last=" << ValueOrZero(last, "memcache_stored_keys") << "\n"
+                  << "Prefix tree: nodes=" << ValueOrZero(last, "memcache_prefix_tree_nodes")
+                  << ", orphans=" << ValueOrZero(last, "memcache_prefix_tree_orphans")
+                  << ", parent_conflicts=" << ValueOrZero(last, "memcache_prefix_tree_parent_conflicts")
+                  << ", stale_heap_pops=" << ValueOrZero(last, "memcache_prefix_tree_stale_heap_pops") << "\n"
+                  << "Prefix eviction: attempts=" << Delta("memcache_prefix_eviction_attempts_total")
+                  << ", successes=" << Delta("memcache_prefix_eviction_success_total")
+                  << ", lru_fallbacks=" << Delta("memcache_prefix_eviction_lru_fallback_total") << "\n";
     }
 
 private:
@@ -1014,7 +1022,7 @@ void StopPerf(pid_t perfPid)
 }
 
 int RunMetaService(const std::string &metaUrl, const std::string &bmUrl, const std::string &metricsUrl,
-                   const std::string &logFile, uint64_t capacityMB)
+                   const std::string &logFile, const BenchConfig &benchConfig)
 {
     RedirectLogsToFile(logFile);
 
@@ -1024,6 +1032,7 @@ int RunMetaService(const std::string &metaUrl, const std::string &bmUrl, const s
     CopyStr(metricsUrl, cfg.httpURL, sizeof(cfg.httpURL));
     cfg.haEnable = false;
     cfg.lruShardCount = MMC_DEFAULT_META_LRU_SHARD_COUNT;
+    cfg.prefixEvictionEnabled = benchConfig.prefixEvictionEnabled;
     cfg.logLevel = WARN_LEVEL;
     cfg.evictThresholdHigh = kEvictThresholdHigh;
     cfg.evictThresholdLow = kEvictThresholdLow;
@@ -1224,6 +1233,8 @@ bool ParseArgs(int argc, char *argv[], BenchConfig &cfg)
                 << kDefaultPrefixComponentCount << ")\n"
                 << "  --seed <value>                        Prefix workload seed (default: "
                 << kDefaultPrefixSeed << ")\n"
+                << "  --prefix-eviction                     Prefer prefix leaves before LRU eviction"
+                << " (default: off)\n"
                 << "  --validate-prefix-workload             Run prefix generator self-check and exit\n";
             return false;
         }
@@ -1233,6 +1244,10 @@ bool ParseArgs(int argc, char *argv[], BenchConfig &cfg)
         }
         if (a == "--validate-prefix-workload") {
             cfg.validatePrefixWorkload = true;
+            continue;
+        }
+        if (a == "--prefix-eviction") {
+            cfg.prefixEvictionEnabled = true;
             continue;
         }
         if (i + 1 >= argc) {
@@ -1347,6 +1362,7 @@ int main(int argc, char *argv[])
               << "  Total ops:    " << (cfg.processCount * cfg.threadCount * cfg.opsPerThread) << "\n"
               << "  Key space:    " << cfg.keySpaceSize << "\n"
               << "  Workload:     " << WorkloadModeName(cfg.workloadMode) << "\n"
+              << "  Prefix eviction: " << (cfg.prefixEvictionEnabled ? "on" : "off") << "\n"
               << "  Blob size:    " << cfg.blobSize << " bytes\n"
               << "  Warmup keys:  " << cfg.warmupKeyCount << "\n"
               << "  Put percent:  " << cfg.putPercent << "%\n"
@@ -1383,7 +1399,7 @@ int main(int argc, char *argv[])
     std::cout << "[1/3] Starting meta_service process..." << std::endl;
     pid_t metaPid = fork();
     if (metaPid == 0) {
-        return RunMetaService(metaUrl, bmUrl, metricsUrl, cfg.logFile, cfg.capacityMB);
+        return RunMetaService(metaUrl, bmUrl, metricsUrl, cfg.logFile, cfg);
     }
     if (metaPid < 0) {
         std::cerr << "Failed to fork meta_service!" << std::endl;
